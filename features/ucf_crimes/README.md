@@ -1,4 +1,4 @@
-- Install dependencies
+### Install dependencies
 ```
 pip install ftfy regex tqdm
 # CUDA 12.8
@@ -7,8 +7,9 @@ pip install opencv-python
 
 ```
 
-- Extract features
-Single video:
+### Extract features
+#### Pretrained CLIP Vision Encoder
+- Single video:
 ```
 python features/ucf_crimes/extract_clip_vit.py \
     --video /mnt/c/JJS/UCF_Crimes/Videos/train/Abuse/Abuse001_x264.mp4 \
@@ -23,6 +24,20 @@ python features/ucf_crimes/extract_clip_vit.py \
     --output_dir /mnt/c/JJS/UCF_Crimes/Features/CLIP-ViT-B32 \
     --video_ext .mp4
 ```
+
+#### Mobile CLIP Setup
+[Official MobileCLIP (CVPR'24)](https://github.com/apple/ml-mobileclip)
+
+Installation:
+```
+# OpenCLIP (if required)
+pip install open_clip_torch
+
+# MobileCLIP (optional, for reparameterization)
+git clone https://github.com/apple/ml-mobileclip.git
+cd ml-mobileclip && pip install -e .
+```
+
 ---
 - Single GPU (default)
 ```
