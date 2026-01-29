@@ -1,15 +1,18 @@
 import os
 import glob
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+from mpl_toolkits.mplot3d import Axes3D
 from tqdm import tqdm
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
+from collections import defaultdict
 
-# 시간 변환 헬퍼 함수
+
 def time_to_seconds(t_str):
+    """시간 문자열을 초 단위로 변환"""
     if pd.isna(t_str) or not isinstance(t_str, str):
         return 0.0
     try:
@@ -18,107 +21,232 @@ def time_to_seconds(t_str):
     except:
         return 0.0
 
-# 메타데이터 스캔 및 균형 샘플링 함수
-def get_balanced_dataset(feature_dir, timestamp_dir, target_total=10000, ratio=1.0):
-    # (1) 어노테이션 로드 및 파일명 정규화
+
+def parse_annotations(timestamp_dir):
+    """어노테이션 CSV 파일들을 파싱하여 anomaly_map 반환"""
     anomaly_map = {}
     csv_files = glob.glob(os.path.join(timestamp_dir, "*.csv"))
-    
+
     print("Step 1: Parsing CSV annotations...")
+    print(f"  - Found {len(csv_files)} CSV files in {timestamp_dir}")
     for csv_file in csv_files:
         try:
-            # 파일명 일치를 위해 확장자 제거 로직 적용
             df = pd.read_csv(csv_file, usecols=['file_name', 'start_time', 'end_time'])
             for _, row in df.iterrows():
-                # 'Abuse001_x264.mp4' -> 'Abuse001_x264'
                 clean_name = os.path.splitext(str(row['file_name']).strip())[0]
                 if clean_name not in anomaly_map:
                     anomaly_map[clean_name] = []
                 anomaly_map[clean_name].append((
-                    time_to_seconds(row['start_time']), 
+                    time_to_seconds(row['start_time']),
                     time_to_seconds(row['end_time'])
                 ))
         except Exception as e:
-            print(f"  - Skip {os.path.basename(csv_file)} due to format error")
+            print(f"  - Skip {os.path.basename(csv_file)} due to format error: {e}")
 
-    # (2) 인덱스 정보 수집 (메모리 절약형 스캔)
+    print(f"  - Parsed {len(anomaly_map)} videos with anomaly annotations")
+    if anomaly_map:
+        sample_keys = list(anomaly_map.keys())[:3]
+        print(f"  - Sample video names in anomaly_map: {sample_keys}")
+    print(f"anomaly_map: {len(anomaly_map)}")
+    return anomaly_map
+
+
+def scan_metadata(feature_dir, anomaly_map):
+    """피처 파일들을 스캔하여 메타데이터 수집 (3가지 카테고리)"""
     meta_abnormal = []
-    meta_normal = []
+    meta_entirely_normal = []  # Normal 폴더 또는 normal 파일명
+    meta_non_abnormal = []     # 이상 영상 내 정상 구간
+
     npy_files = glob.glob(os.path.join(feature_dir, "**/*.npy"), recursive=True)
-    
+
     print(f"Step 2: Scanning {len(npy_files)} feature files...")
     for npy_path in tqdm(npy_files):
-        # 'Abuse001_x264.npy' -> 'Abuse001_x264'
         video_name = os.path.splitext(os.path.basename(npy_path))[0]
-        
-        # 'Normal' 폴더 혹은 어노테이션 미존재 시 전체 정상
-        is_video_entirely_normal = "Normal" in npy_path or video_name not in anomaly_map
-        
-        # 파일 전체를 로드하지 않고 shape만 먼저 확인 (메모리 최적화)
+
+        is_video_entirely_normal = "Normal" in npy_path or "normal" in video_name.lower()
+        has_anomaly_annotation = video_name in anomaly_map
+
         feat_data = np.load(npy_path, mmap_mode='r')
         num_snippets = feat_data.shape[0]
-        
-        for i in range(num_snippets):
-            # 시간 해석 규칙: (N * 16 // 30)
-            timestamp = (i * 16) // 30
-            
-            label = 'normal'
-            if not is_video_entirely_normal:
-                if any(start <= timestamp <= end for start, end in anomaly_map[video_name]):
-                    label = 'abnormal'
-            
-            if label == 'abnormal':
-                meta_abnormal.append((npy_path, i, 'abnormal'))
-            else:
-                meta_normal.append((npy_path, i, 'normal'))
 
-    # (3) 비율에 따른 샘플링
+        for i in range(num_snippets):
+            timestamp = (i * 16) // 30
+
+            if is_video_entirely_normal or not has_anomaly_annotation:
+                meta_entirely_normal.append((npy_path, i, 'entirely_normal'))
+            else:
+                if any(start <= timestamp <= end for start, end in anomaly_map[video_name]):
+                    meta_abnormal.append((npy_path, i, 'abnormal'))
+                else:
+                    meta_non_abnormal.append((npy_path, i, 'non_abnormal'))
+
+    print(f"  - Found: abnormal={len(meta_abnormal)}, entirely_normal={len(meta_entirely_normal)}, non_abnormal={len(meta_non_abnormal)}")
+    return meta_abnormal, meta_entirely_normal, meta_non_abnormal
+
+
+def sample_binary(meta_abnormal, meta_entirely_normal, meta_non_abnormal, target_total, ratio):
+    """Binary 모드: abnormal vs normal (1:ratio)"""
+    # normal = entirely_normal + non_abnormal
+    meta_normal = [(p, i, 'Normal') for p, i, _ in meta_entirely_normal + meta_non_abnormal]
+
     n_abn_target = int(target_total / (1 + ratio))
     n_abn_actual = min(len(meta_abnormal), n_abn_target)
-    n_nor_actual = int(n_abn_actual * ratio)
-    
+    n_nor_actual = min(len(meta_normal), int(n_abn_actual * ratio))
+
     sampled_abn = [meta_abnormal[i] for i in np.random.choice(len(meta_abnormal), n_abn_actual, replace=False)]
     sampled_nor = [meta_normal[i] for i in np.random.choice(len(meta_normal), n_nor_actual, replace=False)]
-    
+
     final_meta = sampled_abn + sampled_nor
     np.random.shuffle(final_meta)
-    
-    # (4) 실제 피처 데이터 로드
+
+    print(f"  - Sampled (binary): abnormal={len(sampled_abn)}, normal={len(sampled_nor)}")
+    return final_meta
+
+
+def sample_ternary(meta_abnormal, meta_entirely_normal, meta_non_abnormal, target_total):
+    """Ternary 모드: abnormal vs entirely_normal vs non_abnormal (1:1:1)"""
+    n_per_class = target_total // 3
+
+    n_abn = min(len(meta_abnormal), n_per_class)
+    n_entirely = min(len(meta_entirely_normal), n_per_class)
+    n_non_abn = min(len(meta_non_abnormal), n_per_class)
+
+    sampled_abn = [meta_abnormal[i] for i in np.random.choice(len(meta_abnormal), n_abn, replace=False)]
+    sampled_entirely = [meta_entirely_normal[i] for i in np.random.choice(len(meta_entirely_normal), n_entirely, replace=False)] if n_entirely > 0 else []
+    sampled_non_abn = [meta_non_abnormal[i] for i in np.random.choice(len(meta_non_abnormal), n_non_abn, replace=False)] if n_non_abn > 0 else []
+
+    final_meta = sampled_abn + sampled_entirely + sampled_non_abn
+    np.random.shuffle(final_meta)
+
+    print(f"  - Sampled (ternary 1:1:1): abnormal={len(sampled_abn)}, entirely_normal={len(sampled_entirely)}, non_abnormal={len(sampled_non_abn)}")
+    return final_meta
+
+
+def load_features(final_meta):
+    """샘플링된 메타데이터로부터 실제 피처 로드"""
     X, y = [], []
-    # 파일별로 그룹화하여 I/O 횟수 최소화
-    from collections import defaultdict
     groups = defaultdict(list)
-    for p, idx, lab in final_meta: groups[p].append((idx, lab))
-    
+    for p, idx, lab in final_meta:
+        groups[p].append((idx, lab))
+
     print(f"Step 3: Loading {len(final_meta)} sampled features...")
     for p in tqdm(groups.keys()):
         data = np.load(p)
         for idx, lab in groups[p]:
             X.append(data[idx])
             y.append(lab)
-            
+
     return np.array(X), np.array(y)
 
 
-if __name__ == "__main__":
-    FEATURE_DIR = '/mnt/c/JJS/UCF_Crimes/Features/CLIP-ViT-B32/train'
-    TIMESTAMP_DIR = '/mnt/c/JJS/UCF_Crimes/Videos/train/00_timestamp'
+def get_balanced_dataset(feature_dir, timestamp_dir, target_total=10000, ratio=1.0, label_mode='binary'):
+    """메인 데이터셋 로드 함수"""
+    anomaly_map = parse_annotations(timestamp_dir)
+    meta_abnormal, meta_entirely_normal, meta_non_abnormal = scan_metadata(feature_dir, anomaly_map)
 
-    # 데이터 준비 (1:1 비율로 10,000개 추출)
-    X, y = get_balanced_dataset(FEATURE_DIR, TIMESTAMP_DIR, target_total=10000, ratio=1.0)
+    if label_mode == 'binary':
+        final_meta = sample_binary(meta_abnormal, meta_entirely_normal, meta_non_abnormal, target_total, ratio)
+    else:  # ternary
+        final_meta = sample_ternary(meta_abnormal, meta_entirely_normal, meta_non_abnormal, target_total)
 
-    # 차원의 저주(Curse of Dimensionality) 방지를 위해 PCA 선행 (50차원)
+    return load_features(final_meta)
+
+
+def visualize_2d(X_tsne, y, color_map, labels_order, label_mode, ratio):
+    """2D t-SNE 시각화"""
+    plt.figure(figsize=(10, 7))
+    for label in labels_order:
+        mask = y == label
+        if mask.sum() > 0:
+            plt.scatter(X_tsne[mask, 0], X_tsne[mask, 1],
+                       c=color_map[label], label=label, s=10, alpha=0.6)
+    plt.xlabel('t-SNE Component 1')
+    plt.ylabel('t-SNE Component 2')
+
+    if label_mode == 'binary':
+        plt.title(f"t-SNE 2D (Binary, Samples: {len(y)}, Ratio {ratio}:1)")
+    else:
+        plt.title(f"t-SNE 2D (Ternary 1:1:1, Samples: {len(y)})")
+
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"vad_tsne_{label_mode}_2d.png", dpi=300)
+    plt.show()
+
+
+def visualize_3d(X_tsne, y, color_map, labels_order, label_mode, ratio):
+    """3D t-SNE 시각화"""
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection='3d')
+
+    for label in labels_order:
+        mask = y == label
+        if mask.sum() > 0:
+            ax.scatter(X_tsne[mask, 0], X_tsne[mask, 1], X_tsne[mask, 2],
+                      c=color_map[label], label=label, s=10, alpha=0.6)
+
+    ax.set_xlabel('t-SNE Component 1')
+    ax.set_ylabel('t-SNE Component 2')
+    ax.set_zlabel('t-SNE Component 3')
+
+    if label_mode == 'binary':
+        ax.set_title(f"t-SNE 3D (Binary, Samples: {len(y)}, Ratio {ratio}:1)")
+    else:
+        ax.set_title(f"t-SNE 3D (Ternary 1:1:1, Samples: {len(y)})")
+
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(f"vad_tsne_{label_mode}_3d.png", dpi=300)
+    plt.show()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='t-SNE visualization for VAD features')
+    parser.add_argument('--feature-dir', type=str, required=True, help='Feature directory path')
+    parser.add_argument('--timestamp-dir', type=str, required=True, help='Timestamp CSV directory path')
+    parser.add_argument('--label-mode', type=str, choices=['binary', 'ternary'], default='binary',
+                        help='binary: normal/abnormal, ternary: abnormal/entirely_normal/non_abnormal (1:1:1)')
+    parser.add_argument('--n-components', type=int, choices=[2, 3], default=2, help='t-SNE dimensions')
+    parser.add_argument('--target-total', type=int, default=10000, help='Total samples to extract')
+    parser.add_argument('--ratio', type=float, default=1.0, help='normal:abnormal ratio (binary mode only)')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    args = parser.parse_args()
+
+    np.random.seed(args.seed)
+
+    # 데이터 로드
+    X, y = get_balanced_dataset(
+        args.feature_dir,
+        args.timestamp_dir,
+        target_total=args.target_total,
+        ratio=args.ratio,
+        label_mode=args.label_mode
+    )
+
+    # PCA 차원 축소
     print("Running PCA for dimension reduction...")
-    X_pca = PCA(n_components=50, random_state=42).fit_transform(X)
+    X_pca = PCA(n_components=50, random_state=args.seed).fit_transform(X)
 
-    # t-SNE 실행 (진행 로그 확인을 위해 verbose=1)
-    print("Running t-SNE...")
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42, verbose=1, init='pca', learning_rate='auto')
+    # t-SNE 실행
+    print(f"Running t-SNE with {args.n_components}D...")
+    tsne = TSNE(n_components=args.n_components, perplexity=30, random_state=args.seed,
+                verbose=1, init='pca', learning_rate='auto')
     X_tsne = tsne.fit_transform(X_pca)
 
-    # 결과 시각화
-    plt.figure(figsize=(10, 7))
-    sns.scatterplot(x=X_tsne[:, 0], y=X_tsne[:, 1], hue=y, palette={'abnormal':'red', 'normal':'blue'}, s=10, alpha=0.6)
-    plt.title(f"t-SNE Visualization (Samples: {len(y)}, Ratio 1:1)")
-    plt.savefig("vad_tsne_result.png")
-    plt.show()
+    # 시각화 설정
+    if args.label_mode == 'binary':
+        color_map = {'abnormal': 'red', 'normal': 'blue'}
+        labels_order = ['abnormal', 'normal']
+    else:
+        color_map = {'abnormal': 'red', 'entirely_normal': 'blue', 'non_abnormal': 'green'}
+        labels_order = ['abnormal', 'entirely_normal', 'non_abnormal']
+
+    # 시각화
+    if args.n_components == 2:
+        visualize_2d(X_tsne, y, color_map, labels_order, args.label_mode, args.ratio)
+    else:
+        visualize_3d(X_tsne, y, color_map, labels_order, args.label_mode, args.ratio)
+
+
+if __name__ == "__main__":
+    main()
