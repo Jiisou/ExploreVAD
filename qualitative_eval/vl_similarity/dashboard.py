@@ -27,6 +27,8 @@ from similarity import (
     compute_similarity_matrix,
     build_text_prompts,
     apply_smoothing,
+    parse_annotations,
+    lookup_annotation,
 )
 
 
@@ -57,6 +59,7 @@ def plot_similarity(
     shape_info,
     show_raw,
     smoothing,
+    anomaly_intervals=None,
 ):
     """
     Plot similarity-over-time chart for a single video.
@@ -70,9 +73,22 @@ def plot_similarity(
         shape_info: shape tuple for display
         show_raw: whether to show raw signal behind smoothed
         smoothing: smoothing window size
+        anomaly_intervals: list of (start_sec, end_sec) tuples or None
     """
     fig, ax = plt.subplots(figsize=(14, 4))
     time_axis = np.arange(sim_matrix.shape[0])
+
+    # Draw anomaly shading first (behind everything)
+    if anomaly_intervals:
+        for i, (start, end) in enumerate(anomaly_intervals):
+            ax.axvspan(
+                start,
+                end,
+                color="red",
+                alpha=0.12,
+                zorder=0,
+                label="Anomaly interval" if i == 0 else None,
+            )
 
     own_idx = class_names.index(own_class) if own_class in class_names else -1
 
@@ -112,7 +128,7 @@ def plot_similarity(
     ax.legend(
         loc="upper right",
         fontsize=7,
-        ncol=min(len(class_names), 5),
+        ncol=min(len(class_names) + (1 if anomaly_intervals else 0), 6),
         framealpha=0.8,
     )
     ax.grid(True, alpha=0.3)
@@ -137,6 +153,12 @@ def main():
             "Feature Root Path",
             value="",
             help="Root directory containing class-name subfolders with .npy feature files.",
+        )
+        timestamp_dir = st.text_input(
+            "Timestamp Annotation Dir (optional)",
+            value="",
+            help="Directory containing *_timestamps.csv files (e.g., Abuse_timestamps.csv). "
+                 "Anomaly intervals will be shaded on the graphs.",
         )
 
         st.divider()
@@ -288,6 +310,12 @@ def main():
         st.error(f"Text encoding failed: {e}")
         return
 
+    # Parse anomaly annotations (if provided)
+    anomaly_map = {}
+    if timestamp_dir and os.path.isdir(timestamp_dir):
+        anomaly_map = parse_annotations(timestamp_dir)
+        st.info(f"Loaded annotations for **{len(anomaly_map)}** videos from `{timestamp_dir}`")
+
     # Compute and plot per-video similarity
     st.divider()
     st.subheader("Similarity over Time")
@@ -307,6 +335,9 @@ def main():
         sim_matrix = compute_similarity_matrix(video_features, text_embeddings)
         sim_smoothed = apply_smoothing(sim_matrix, smoothing)
 
+        # Look up anomaly intervals for this video
+        intervals = lookup_annotation(video_name, anomaly_map)
+
         fig = plot_similarity(
             sim_matrix=sim_matrix,
             sim_smoothed=sim_smoothed,
@@ -316,6 +347,7 @@ def main():
             shape_info=video_features.shape,
             show_raw=show_raw,
             smoothing=smoothing,
+            anomaly_intervals=intervals,
         )
         st.pyplot(fig)
         plt.close(fig)

@@ -7,8 +7,10 @@ and cosine similarity computation. No UI dependencies.
 
 import os
 import re
+import glob
 import random
 import numpy as np
+import pandas as pd
 from pathlib import Path
 
 
@@ -179,6 +181,90 @@ def build_text_prompts(class_names, template="{}"):
         readable = split_camel_case(name)
         prompts.append(template.format(readable))
     return prompts
+
+
+def time_to_seconds(t_str):
+    """
+    Convert time string (H:MM:SS or HH:MM:SS) to seconds.
+
+    Args:
+        t_str: time string, e.g. "0:00:06" or "0:01:30"
+
+    Returns:
+        float seconds
+    """
+    if pd.isna(t_str) or not isinstance(t_str, str):
+        return 0.0
+    try:
+        parts = list(map(float, t_str.strip().split(":")))
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        elif len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        else:
+            return float(parts[0])
+    except Exception:
+        return 0.0
+
+
+def parse_annotations(timestamp_dir):
+    """
+    Parse all timestamp CSV files from a directory into an anomaly map.
+
+    Each CSV is expected to have columns: file_name, start_time, end_time
+    with times in H:MM:SS format.
+
+    Args:
+        timestamp_dir: path to directory containing *_timestamps.csv files
+
+    Returns:
+        dict[str, list[tuple[float, float]]]:
+            {video_base_name: [(start_sec, end_sec), ...]}
+    """
+    anomaly_map = {}
+    csv_files = glob.glob(os.path.join(timestamp_dir, "*.csv"))
+
+    for csv_file in csv_files:
+        try:
+            df = pd.read_csv(csv_file)
+            # Normalize column names (strip whitespace)
+            df.columns = [c.strip() for c in df.columns]
+
+            if "file_name" not in df.columns:
+                continue
+
+            for _, row in df.iterrows():
+                fname = str(row["file_name"]).strip()
+                # Remove .mp4 extension
+                clean_name = os.path.splitext(fname)[0]
+
+                start = time_to_seconds(str(row.get("start_time", "")))
+                end = time_to_seconds(str(row.get("end_time", "")))
+
+                if end <= start:
+                    continue
+
+                if clean_name not in anomaly_map:
+                    anomaly_map[clean_name] = []
+                anomaly_map[clean_name].append((start, end))
+        except Exception:
+            continue
+
+    return anomaly_map
+
+
+def lookup_annotation(video_name, anomaly_map):
+    """
+    Look up anomaly intervals for a video name.
+
+    Args:
+        video_name: base name of npy file (without extension)
+        anomaly_map: dict from parse_annotations()
+
+    Returns:
+        list of (start_sec, end_sec) tuples, or empty list if not found.
+    """
+    return anomaly_map.get(video_name, [])
 
 
 def apply_smoothing(data, window_size):
