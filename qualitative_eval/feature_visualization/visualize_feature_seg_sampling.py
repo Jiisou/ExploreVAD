@@ -47,7 +47,6 @@ def parse_annotations(timestamp_dir):
     if anomaly_map:
         sample_keys = list(anomaly_map.keys())[:3]
         print(f"  - Sample video names in anomaly_map: {sample_keys}")
-    print(f"anomaly_map: {len(anomaly_map)}")
     return anomaly_map
 
 
@@ -122,6 +121,35 @@ def sample_ternary(meta_abnormal, meta_entirely_normal, meta_non_abnormal, targe
     return final_meta
 
 
+def sample_single_class(meta_list, label, target_total):
+    """단일 클래스만 샘플링"""
+    n_samples = min(len(meta_list), target_total)
+    if n_samples == 0:
+        print(f"  - Warning: No samples available for '{label}'")
+        return []
+
+    sampled = [meta_list[i] for i in np.random.choice(len(meta_list), n_samples, replace=False)]
+    print(f"  - Sampled ({label} only): {len(sampled)}")
+    return sampled
+
+
+def sample_abn_vs_non_abn(meta_abnormal, meta_non_abnormal, target_total):
+    """abnormal vs non_abnormal (1:1) - 이상 영상 내 구간만 비교"""
+    n_per_class = target_total // 2
+
+    n_abn = min(len(meta_abnormal), n_per_class)
+    n_non_abn = min(len(meta_non_abnormal), n_per_class)
+
+    sampled_abn = [meta_abnormal[i] for i in np.random.choice(len(meta_abnormal), n_abn, replace=False)] if n_abn > 0 else []
+    sampled_non_abn = [meta_non_abnormal[i] for i in np.random.choice(len(meta_non_abnormal), n_non_abn, replace=False)] if n_non_abn > 0 else []
+
+    final_meta = sampled_abn + sampled_non_abn
+    np.random.shuffle(final_meta)
+
+    print(f"  - Sampled (abn_vs_non_abn 1:1): abnormal={len(sampled_abn)}, non_abnormal={len(sampled_non_abn)}")
+    return final_meta
+
+
 def load_features(final_meta):
     """샘플링된 메타데이터로부터 실제 피처 로드"""
     X, y = [], []
@@ -146,13 +174,23 @@ def get_balanced_dataset(feature_dir, timestamp_dir, target_total=10000, ratio=1
 
     if label_mode == 'binary':
         final_meta = sample_binary(meta_abnormal, meta_entirely_normal, meta_non_abnormal, target_total, ratio)
-    else:  # ternary
+    elif label_mode == 'ternary':
         final_meta = sample_ternary(meta_abnormal, meta_entirely_normal, meta_non_abnormal, target_total)
+    elif label_mode == 'abnormal_only':
+        final_meta = sample_single_class(meta_abnormal, 'abnormal', target_total)
+    elif label_mode == 'non_abnormal_only':
+        final_meta = sample_single_class(meta_non_abnormal, 'non_abnormal', target_total)
+    elif label_mode == 'entirely_normal_only':
+        final_meta = sample_single_class(meta_entirely_normal, 'entirely_normal', target_total)
+    elif label_mode == 'abn_vs_non_abn':
+        final_meta = sample_abn_vs_non_abn(meta_abnormal, meta_non_abnormal, target_total)
+    else:
+        raise ValueError(f"Unknown label_mode: {label_mode}")
 
     return load_features(final_meta)
 
 
-def visualize_2d(X_tsne, y, color_map, labels_order, label_mode, ratio):
+def visualize_2d(X_tsne, y, color_map, labels_order, label_mode):
     """2D t-SNE 시각화"""
     plt.figure(figsize=(10, 7))
     for label in labels_order:
@@ -162,19 +200,14 @@ def visualize_2d(X_tsne, y, color_map, labels_order, label_mode, ratio):
                        c=color_map[label], label=label, s=10, alpha=0.6)
     plt.xlabel('t-SNE Component 1')
     plt.ylabel('t-SNE Component 2')
-
-    if label_mode == 'binary':
-        plt.title(f"t-SNE 2D (Binary, Samples: {len(y)}, Ratio {ratio}:1)")
-    else:
-        plt.title(f"t-SNE 2D (Ternary 1:1:1, Samples: {len(y)})")
-
+    plt.title(f"t-SNE 2D ({label_mode}, Samples: {len(y)})")
     plt.legend()
     plt.tight_layout()
     plt.savefig(f"vad_tsne_{label_mode}_2d.png", dpi=300)
     plt.show()
 
 
-def visualize_3d(X_tsne, y, color_map, labels_order, label_mode, ratio):
+def visualize_3d(X_tsne, y, color_map, labels_order, label_mode):
     """3D t-SNE 시각화"""
     fig = plt.figure(figsize=(12, 9))
     ax = fig.add_subplot(111, projection='3d')
@@ -188,12 +221,7 @@ def visualize_3d(X_tsne, y, color_map, labels_order, label_mode, ratio):
     ax.set_xlabel('t-SNE Component 1')
     ax.set_ylabel('t-SNE Component 2')
     ax.set_zlabel('t-SNE Component 3')
-
-    if label_mode == 'binary':
-        ax.set_title(f"t-SNE 3D (Binary, Samples: {len(y)}, Ratio {ratio}:1)")
-    else:
-        ax.set_title(f"t-SNE 3D (Ternary 1:1:1, Samples: {len(y)})")
-
+    ax.set_title(f"t-SNE 3D ({label_mode}, Samples: {len(y)})")
     ax.legend()
     plt.tight_layout()
     plt.savefig(f"vad_tsne_{label_mode}_3d.png", dpi=300)
@@ -203,9 +231,11 @@ def visualize_3d(X_tsne, y, color_map, labels_order, label_mode, ratio):
 def main():
     parser = argparse.ArgumentParser(description='t-SNE visualization for VAD features')
     parser.add_argument('--feature-dir', type=str, required=True, help='Feature directory path')
-    parser.add_argument('--timestamp-dir', type=str, required=True, help='Timestamp CSV directory path')
-    parser.add_argument('--label-mode', type=str, choices=['binary', 'ternary'], default='binary',
-                        help='binary: normal/abnormal, ternary: abnormal/entirely_normal/non_abnormal (1:1:1)')
+    parser.add_argument('--timestamp-dir', type=str, help='Timestamp CSV directory path', default="/mnt/c/JJS/UCF_Crimes/Videos/train/00_timestamp/")
+    parser.add_argument('--label-mode', type=str,
+                        choices=['binary', 'ternary', 'abnormal_only', 'non_abnormal_only', 'entirely_normal_only', 'abn_vs_non_abn'],
+                        default='binary',
+                        help='binary: normal/abnormal, ternary: 1:1:1, abnormal_only, non_abnormal_only, entirely_normal_only, abn_vs_non_abn: abnormal vs non_abnormal (1:1)')
     parser.add_argument('--n-components', type=int, choices=[2, 3], default=2, help='t-SNE dimensions')
     parser.add_argument('--target-total', type=int, default=10000, help='Total samples to extract')
     parser.add_argument('--ratio', type=float, default=1.0, help='normal:abnormal ratio (binary mode only)')
@@ -234,18 +264,33 @@ def main():
     X_tsne = tsne.fit_transform(X_pca)
 
     # 시각화 설정
+    color_map = {
+        'abnormal': 'red',
+        'Normal': 'blue',
+        'entirely_normal': 'blue',
+        'non_abnormal': 'green'
+    }
+
     if args.label_mode == 'binary':
-        color_map = {'abnormal': 'red', 'normal': 'blue'}
-        labels_order = ['abnormal', 'normal']
-    else:
-        color_map = {'abnormal': 'red', 'entirely_normal': 'blue', 'non_abnormal': 'green'}
+        labels_order = ['abnormal', 'Normal']
+    elif args.label_mode == 'ternary':
         labels_order = ['abnormal', 'entirely_normal', 'non_abnormal']
+    elif args.label_mode == 'abnormal_only':
+        labels_order = ['abnormal']
+    elif args.label_mode == 'non_abnormal_only':
+        labels_order = ['non_abnormal']
+    elif args.label_mode == 'entirely_normal_only':
+        labels_order = ['entirely_normal']
+    elif args.label_mode == 'abn_vs_non_abn':
+        labels_order = ['abnormal', 'non_abnormal']
+    else:
+        labels_order = list(set(y))
 
     # 시각화
     if args.n_components == 2:
-        visualize_2d(X_tsne, y, color_map, labels_order, args.label_mode, args.ratio)
+        visualize_2d(X_tsne, y, color_map, labels_order, args.label_mode)
     else:
-        visualize_3d(X_tsne, y, color_map, labels_order, args.label_mode, args.ratio)
+        visualize_3d(X_tsne, y, color_map, labels_order, args.label_mode)
 
 
 if __name__ == "__main__":
