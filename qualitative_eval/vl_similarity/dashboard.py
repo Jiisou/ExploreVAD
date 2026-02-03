@@ -60,6 +60,8 @@ def plot_similarity(
     show_raw,
     smoothing,
     anomaly_intervals=None,
+    legend_names=None,
+    own_class_en=None,
 ):
     """
     Plot similarity-over-time chart for a single video.
@@ -67,14 +69,18 @@ def plot_similarity(
     Args:
         sim_matrix: [T, C] raw similarity matrix
         sim_smoothed: [T, C] smoothed similarity matrix
-        class_names: list of class names (legend labels)
-        own_class: the class this video belongs to
+        class_names: list of original class names (used for own_class matching)
+        own_class: the class this video belongs to (original folder name)
         video_name: display name
         shape_info: shape tuple for display
         show_raw: whether to show raw signal behind smoothed
         smoothing: smoothing window size
         anomaly_intervals: list of (start_sec, end_sec) tuples or None
+        legend_names: list of display names for legend (English). If None, uses class_names.
+        own_class_en: English display name for own_class (for bilingual title). If None, omitted.
     """
+    labels = legend_names if legend_names is not None else class_names
+
     fig, ax = plt.subplots(figsize=(14, 4))
     time_axis = np.arange(sim_matrix.shape[0])
 
@@ -92,7 +98,7 @@ def plot_similarity(
 
     own_idx = class_names.index(own_class) if own_class in class_names else -1
 
-    for i, cls in enumerate(class_names):
+    for i, cls in enumerate(labels):
         is_own = i == own_idx
         linewidth = 2.5 if is_own else 1.0
         alpha = 1.0 if is_own else 0.5
@@ -118,17 +124,23 @@ def plot_similarity(
             zorder=zorder,
         )
 
+    # Build title: bilingual when own_class_en is provided
+    if own_class_en and own_class_en != own_class:
+        class_label = f"{own_class} ({own_class_en})"
+    else:
+        class_label = own_class
+
     ax.set_xlabel("Time (seconds)", fontsize=11)
     ax.set_ylabel("Cosine Similarity", fontsize=11)
     ax.set_title(
-        f"{video_name}  |  class: {own_class}  |  shape: {shape_info}",
+        f"{video_name}  |  class: {class_label}  |  shape: {shape_info}",
         fontsize=12,
         fontweight="bold",
     )
     ax.legend(
         loc="upper right",
         fontsize=7,
-        ncol=min(len(class_names) + (1 if anomaly_intervals else 0), 6),
+        ncol=min(len(labels) + (1 if anomaly_intervals else 0), 6),
         framealpha=0.8,
     )
     ax.grid(True, alpha=0.3)
@@ -195,6 +207,13 @@ def main():
             "{}",
             "Custom",
         ]
+        korean_mode = st.checkbox(
+            "Korean class names (auto-translate to English)",
+            value=False,
+            help="Enable if folder names are in Korean. "
+                 "Translates to English via GoogleTranslator before encoding. "
+                 "Requires: pip install deep-translator",
+        )
         template_choice = st.selectbox("Prompt Template", template_options)
         if template_choice == "Custom":
             template = st.text_input(
@@ -298,10 +317,18 @@ def main():
         return
 
     # Encode text prompts
-    prompts = build_text_prompts(selected_classes, template=template)
+    prompts, display_names = build_text_prompts(
+        selected_classes, template=template, korean_mode=korean_mode
+    )
+    # Build mapping: original class name -> English display name
+    class_to_en = dict(zip(selected_classes, display_names))
+
     with st.expander("Text Prompts", expanded=False):
-        for cls, prompt in zip(selected_classes, prompts):
-            st.text(f"  {cls} -> \"{prompt}\"")
+        for cls, name, prompt in zip(selected_classes, display_names, prompts):
+            if korean_mode:
+                st.text(f"  {cls} -> {name} -> \"{prompt}\"")
+            else:
+                st.text(f"  {cls} -> \"{prompt}\"")
 
     try:
         with st.spinner("Encoding text prompts..."):
@@ -348,6 +375,8 @@ def main():
             show_raw=show_raw,
             smoothing=smoothing,
             anomaly_intervals=intervals,
+            legend_names=display_names,
+            own_class_en=class_to_en.get(class_name),
         )
         st.pyplot(fig)
         plt.close(fig)
@@ -365,7 +394,11 @@ def main():
 
     for i, (class_name, npy_path) in enumerate(sampled.items()):
         video_name = os.path.splitext(os.path.basename(npy_path))[0]
-        video_labels.append(f"{video_name}\n({class_name})")
+        en = class_to_en.get(class_name)
+        if en and en != class_name:
+            video_labels.append(f"{video_name}\n({class_name} / {en})")
+        else:
+            video_labels.append(f"{video_name}\n({class_name})")
         try:
             video_features = cached_load_features(npy_path)
             sim = compute_similarity_matrix(video_features, text_embeddings)
@@ -377,8 +410,8 @@ def main():
         figsize=(max(8, len(selected_classes) * 0.8), max(4, len(sampled) * 0.6))
     )
     im = ax_hm.imshow(heatmap_data, aspect="auto", cmap="YlOrRd")
-    ax_hm.set_xticks(range(len(selected_classes)))
-    ax_hm.set_xticklabels(selected_classes, rotation=45, ha="right", fontsize=8)
+    ax_hm.set_xticks(range(len(display_names)))
+    ax_hm.set_xticklabels(display_names, rotation=45, ha="right", fontsize=8)
     ax_hm.set_yticks(range(len(video_labels)))
     ax_hm.set_yticklabels(video_labels, fontsize=8)
     ax_hm.set_xlabel("Text Class")

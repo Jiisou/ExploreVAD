@@ -162,7 +162,29 @@ def split_camel_case(name):
     return name.lower().strip()
 
 
-def build_text_prompts(class_names, template="{}"):
+def translate_ko_to_en(texts):
+    """
+    Translate a list of Korean texts to English using deep_translator.
+
+    Args:
+        texts: list of str (Korean class names)
+
+    Returns:
+        list of str (English translations)
+    """
+    from deep_translator import GoogleTranslator
+
+    translator = GoogleTranslator(source="ko", target="en")
+    translated = []
+    for text in texts:
+        try:
+            translated.append(translator.translate(text))
+        except Exception:
+            translated.append(text)
+    return translated
+
+
+def build_text_prompts(class_names, template="{}", korean_mode=False):
     """
     Convert class folder names into text prompts.
 
@@ -172,15 +194,23 @@ def build_text_prompts(class_names, template="{}"):
             - "{}": raw class name (after CamelCase splitting)
             - "a video of {}": e.g., "a video of road accidents"
             - "a photo of {}": CLIP's original zero-shot template
+        korean_mode: if True, translate Korean class names to English
+            before applying the template.
 
     Returns:
-        list of str (same order as class_names)
+        tuple (prompts, display_names):
+            prompts: list of str - full template-applied prompts for encoding
+            display_names: list of str - readable class names for legend display
+                (English translated names when korean_mode=True,
+                 CamelCase-split names otherwise)
     """
-    prompts = []
-    for name in class_names:
-        readable = split_camel_case(name)
-        prompts.append(template.format(readable))
-    return prompts
+    readable_names = [split_camel_case(name) for name in class_names]
+
+    if korean_mode:
+        readable_names = translate_ko_to_en(readable_names)
+
+    prompts = [template.format(name) for name in readable_names]
+    return prompts, readable_names
 
 
 def time_to_seconds(t_str):
