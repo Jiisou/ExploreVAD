@@ -62,7 +62,11 @@ def scan_metadata(feature_dir, anomaly_map):
     for npy_path in tqdm(npy_files):
         video_name = os.path.splitext(os.path.basename(npy_path))[0]
 
-        is_video_entirely_normal = "Normal" in npy_path or "normal" in video_name.lower()
+        # "abnormal" 문자열이 "normal"을 포함하므로, "abnormal"이 아닌 경우에만 "normal" 체크
+        # 또는 경로에 명확히 Normal 폴더가 있는지 확인
+        is_video_entirely_normal = ("Normal" in npy_path) or \
+                                   ("normal" in video_name.lower() and "abnormal" not in video_name.lower())
+        
         has_anomaly_annotation = video_name in anomaly_map
 
         feat_data = np.load(npy_path, mmap_mode='r')
@@ -71,13 +75,14 @@ def scan_metadata(feature_dir, anomaly_map):
         for i in range(num_snippets):
             timestamp = (i * 16) // 30
 
-            if is_video_entirely_normal or not has_anomaly_annotation:
+            if is_video_entirely_normal:
                 meta_entirely_normal.append((npy_path, i, 'entirely_normal'))
-            else:
+            elif has_anomaly_annotation:
                 if any(start <= timestamp <= end for start, end in anomaly_map[video_name]):
                     meta_abnormal.append((npy_path, i, 'abnormal'))
                 else:
                     meta_non_abnormal.append((npy_path, i, 'non_abnormal'))
+            # else: 어노테이션도 없고, 명시적 Normal도 아니면 스킵 (unannotated abnormal 등)
 
     print(f"  - Found: abnormal={len(meta_abnormal)}, entirely_normal={len(meta_entirely_normal)}, non_abnormal={len(meta_non_abnormal)}")
     return meta_abnormal, meta_entirely_normal, meta_non_abnormal
