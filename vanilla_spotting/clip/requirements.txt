@@ -1,0 +1,10 @@
+open_clip_torch 
+torch 
+torchvision 
+decord 
+pandas 
+scikit-learn 
+tqdm 
+matplotlib
+tensorboard
+tensorboardX
