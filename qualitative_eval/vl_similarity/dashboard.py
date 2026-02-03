@@ -98,18 +98,29 @@ def plot_similarity(
 
     own_idx = class_names.index(own_class) if own_class in class_names else -1
 
+    # Binary mode: fixed colors (red=abnormal, blue=normal), equal line weight
+    binary_colors = {0: "red", 1: "royalblue"}
+    is_binary = own_idx == -1 and len(labels) == 2
+
     for i, cls in enumerate(labels):
-        is_own = i == own_idx
-        linewidth = 2.5 if is_own else 1.0
-        alpha = 1.0 if is_own else 0.5
-        zorder = 10 if is_own else 1
+        if is_binary:
+            color = binary_colors.get(i, f"C{i}")
+            linewidth = 2.0
+            alpha = 0.9
+            zorder = 5
+        else:
+            is_own = i == own_idx
+            color = f"C{i}"
+            linewidth = 2.5 if is_own else 1.0
+            alpha = 1.0 if is_own else 0.5
+            zorder = 10 if is_own else 1
 
         if show_raw and smoothing > 1:
             ax.plot(
                 time_axis,
                 sim_matrix[:, i],
                 alpha=0.15,
-                color=f"C{i}",
+                color=color,
                 linewidth=0.5,
                 zorder=0,
             )
@@ -118,7 +129,7 @@ def plot_similarity(
             time_axis,
             sim_smoothed[:, i],
             label=cls,
-            color=f"C{i}",
+            color=color,
             linewidth=linewidth,
             alpha=alpha,
             zorder=zorder,
@@ -201,6 +212,12 @@ def main():
 
         st.divider()
         st.header("Text Prompt Settings")
+        analysis_mode = st.radio(
+            "Analysis Mode",
+            ["Multi-class", "Binary"],
+            help="Multi-class: similarity against each class text. "
+                 "Binary: similarity against 'ABNORMAL situation' vs 'normal'.",
+        )
         template_options = [
             "a photo of {}",
             "a video of {}",
@@ -210,15 +227,21 @@ def main():
         korean_mode = st.checkbox(
             "Korean class names (auto-translate to English)",
             value=False,
+            disabled=analysis_mode == "Binary",
             help="Enable if folder names are in Korean. "
                  "Translates to English via GoogleTranslator before encoding. "
                  "Requires: pip install deep-translator",
         )
-        template_choice = st.selectbox("Prompt Template", template_options)
+        template_choice = st.selectbox(
+            "Prompt Template",
+            template_options,
+            disabled=analysis_mode == "Binary",
+        )
         if template_choice == "Custom":
             template = st.text_input(
                 "Custom template (use {} for class name)",
                 value="a surveillance video of {}",
+                disabled=analysis_mode == "Binary",
             )
         else:
             template = template_choice
@@ -317,18 +340,29 @@ def main():
         return
 
     # Encode text prompts
-    prompts, display_names = build_text_prompts(
-        selected_classes, template=template, korean_mode=korean_mode
-    )
-    # Build mapping: original class name -> English display name
-    class_to_en = dict(zip(selected_classes, display_names))
+    is_binary = analysis_mode == "Binary"
+
+    if is_binary:
+        prompts = ["ABNORMAL situation", "normal"]
+        display_names = ["ABNORMAL", "normal"]
+        class_to_en = {}
+    else:
+        prompts, display_names = build_text_prompts(
+            selected_classes, template=template, korean_mode=korean_mode
+        )
+        # Build mapping: original class name -> English display name
+        class_to_en = dict(zip(selected_classes, display_names))
 
     with st.expander("Text Prompts", expanded=False):
-        for cls, name, prompt in zip(selected_classes, display_names, prompts):
-            if korean_mode:
-                st.text(f"  {cls} -> {name} -> \"{prompt}\"")
-            else:
-                st.text(f"  {cls} -> \"{prompt}\"")
+        if is_binary:
+            for prompt in prompts:
+                st.text(f"  \"{prompt}\"")
+        else:
+            for cls, name, prompt in zip(selected_classes, display_names, prompts):
+                if korean_mode:
+                    st.text(f"  {cls} -> {name} -> \"{prompt}\"")
+                else:
+                    st.text(f"  {cls} -> \"{prompt}\"")
 
     try:
         with st.spinner("Encoding text prompts..."):
@@ -389,7 +423,7 @@ def main():
     st.divider()
     st.subheader("Summary: Mean Similarity Heatmap")
 
-    heatmap_data = np.zeros((len(sampled), len(selected_classes)))
+    heatmap_data = np.zeros((len(sampled), len(display_names)))
     video_labels = []
 
     for i, (class_name, npy_path) in enumerate(sampled.items()):
@@ -407,7 +441,7 @@ def main():
             pass
 
     fig_hm, ax_hm = plt.subplots(
-        figsize=(max(8, len(selected_classes) * 0.8), max(4, len(sampled) * 0.6))
+        figsize=(max(8, len(display_names) * 0.8), max(4, len(sampled) * 0.6))
     )
     im = ax_hm.imshow(heatmap_data, aspect="auto", cmap="YlOrRd")
     ax_hm.set_xticks(range(len(display_names)))
