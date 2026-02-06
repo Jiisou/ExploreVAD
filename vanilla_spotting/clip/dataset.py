@@ -483,6 +483,251 @@ class UCFCrimeSpottingDataset(Dataset):
         return compute_class_weights(labels, num_classes=2)
 
 
+class ETRIFeatureDataset(Dataset):
+    """
+    ETRI Feature Dataset for training on pre-extracted npy features.
+
+    Each .npy file has shape (T_seconds, embed_dim) where row i is the
+    feature vector at second i. Sliding windows of `unit_duration` seconds
+    are created and labeled based on annotation overlap.
+
+    Strict normal sampling: since all classes are anomaly types, normal
+    (untagged) windows are only kept if they end before the earliest event.
+
+    Args:
+        feature_dir: Path to feature directory containing class subdirectories.
+        annotation_dir: Path to directory with {class}_timestamp.csv files.
+        unit_duration: Duration of each window in seconds (default: 2).
+        overlap_ratio: Overlap ratio between consecutive windows (0.0 to 1.0).
+        strict_normal_sampling: If True, discard post-event normal windows.
+        max_files_per_class: Maximum files per class (None = no limit).
+        verbose: Whether to print loading progress.
+        seed: Random seed for reproducible file sampling.
+    """
+
+    def __init__(
+        self,
+        feature_dir: str,
+        annotation_dir: str,
+        unit_duration: int = 2,
+        overlap_ratio: float = 0.5,
+        strict_normal_sampling: bool = True,
+        max_files_per_class: Optional[int] = None,
+        verbose: bool = True,
+        seed: int = 42,
+    ):
+        self.feature_dir = feature_dir
+        self.annotation_dir = annotation_dir
+        self.unit_duration = unit_duration
+        self.overlap_ratio = overlap_ratio
+        self.strict_normal_sampling = strict_normal_sampling
+        self.max_files_per_class = max_files_per_class
+        self.verbose = verbose
+        self.seed = seed
+
+        if not 0.0 <= overlap_ratio < 1.0:
+            raise ValueError(f"overlap_ratio must be in [0.0, 1.0), got {overlap_ratio}")
+
+        self._discarded_post_event: int = 0
+        self.annotations: Dict[str, List[Tuple[float, float]]] = {}
+        self.samples: List[Dict] = []
+
+        self._load_annotations()
+        self._build_samples()
+
+        if self.verbose:
+            self._print_statistics()
+
+    def _load_annotations(self):
+        """Load annotations from all CSV files in annotation_dir."""
+        for csv_file in sorted(os.listdir(self.annotation_dir)):
+            if not csv_file.endswith('.csv'):
+                continue
+            csv_path = os.path.join(self.annotation_dir, csv_file)
+            try:
+                df = pd.read_csv(csv_path, on_bad_lines='skip')
+            except Exception as e:
+                if self.verbose:
+                    print(f"Warning: Could not read {csv_path}: {e}")
+                continue
+
+            for _, row in df.iterrows():
+                file_name = str(row['file_name']).strip()
+                # Remove video extension if present (.mp4, .avi, etc.) for matching with npy stems
+                file_stem = os.path.splitext(file_name)[0]
+                start_time = time_to_seconds(row.get('start_time', 0))
+                end_time = time_to_seconds(row.get('end_time', 0))
+
+                if end_time > start_time:
+                    if file_stem not in self.annotations:
+                        self.annotations[file_stem] = []
+                    self.annotations[file_stem].append((start_time, end_time))
+
+        if self.verbose:
+            print(f"Loaded annotations for {len(self.annotations)} files")
+
+    def _build_samples(self):
+        """Scan npy files and create sliding window samples."""
+        files_by_class: Dict[str, List[str]] = defaultdict(list)
+
+        for class_name in sorted(os.listdir(self.feature_dir)):
+            class_dir = os.path.join(self.feature_dir, class_name)
+            if not os.path.isdir(class_dir):
+                continue
+            for npy_file in sorted(os.listdir(class_dir)):
+                if npy_file.endswith('.npy'):
+                    npy_path = os.path.join(class_dir, npy_file)
+                    files_by_class[class_name].append(npy_path)
+
+        # Apply file balancing
+        npy_files = []
+        if self.max_files_per_class is not None:
+            rng = random.Random(self.seed)
+            for class_name, class_files in sorted(files_by_class.items()):
+                n_original = len(class_files)
+                if n_original > self.max_files_per_class:
+                    sampled = rng.sample(class_files, self.max_files_per_class)
+                else:
+                    sampled = class_files
+                npy_files.extend(sampled)
+                if self.verbose:
+                    print(f"  {class_name}: {len(sampled)}/{n_original} files")
+        else:
+            for class_files in files_by_class.values():
+                npy_files.extend(class_files)
+
+        if self.verbose:
+            print(f"Found {len(npy_files)} npy files (from {len(files_by_class)} classes)")
+
+        file_iter = tqdm(npy_files, desc="Processing features") if self.verbose else npy_files
+        for npy_path in file_iter:
+            self._process_npy_feature(npy_path)
+
+    def _process_npy_feature(self, npy_path: str):
+        """
+        Process a single npy feature file and add sliding window samples.
+
+        Each row in the npy array represents 1 second of video.
+        Windows of `unit_duration` consecutive seconds are created.
+
+        Strict normal sampling:
+            In anomalous videos, normal (untagged) windows are only kept
+            if they end before the earliest annotated event start.
+
+            Timeline:
+            |--normal (keep)--|==EVENT==|--discard--|
+                              ^ earliest_event_start
+
+        Normal class handling:
+            Files in 'normal' or 'Normal' directories (or without annotations)
+            are treated as entirely normal (label=0 for all windows).
+        """
+        file_stem = os.path.splitext(os.path.basename(npy_path))[0]
+        parent_dir = os.path.basename(os.path.dirname(npy_path))
+        is_normal_class = parent_dir.lower() == 'normal'
+
+        # Look up annotation
+        events = self.annotations.get(file_stem, [])
+
+        # Get feature duration from npy shape without loading full array
+        feat = np.load(npy_path, mmap_mode='r')
+        total_seconds = feat.shape[0]
+
+        if total_seconds < self.unit_duration:
+            return
+
+        # If no events and not normal class, skip (missing annotation)
+        if not events and not is_normal_class:
+            return
+
+        # Merge overlapping events
+        if events:
+            events = UCFCrimeSpottingDataset._merge_events(events)
+            earliest_event_start = min(e[0] for e in events)
+        else:
+            earliest_event_start = float('inf')  # No events for normal class
+
+        # Sliding window over seconds
+        stride = max(1, int(self.unit_duration * (1.0 - self.overlap_ratio)))
+        num_windows = max(0, (total_seconds - self.unit_duration) // stride + 1)
+
+        for i in range(num_windows):
+            start_sec = i * stride
+            end_sec = start_sec + self.unit_duration
+
+            # Label: 1 if window overlaps any event, 0 otherwise
+            label = 0
+            if not is_normal_class:
+                for event_start, event_end in events:
+                    if start_sec < event_end and end_sec > event_start:
+                        label = 1
+                        break
+
+            # Strict normal sampling: discard post-event normal windows in anomalous videos
+            if (self.strict_normal_sampling
+                    and not is_normal_class
+                    and label == 0
+                    and end_sec > earliest_event_start):
+                self._discarded_post_event += 1
+                continue
+
+            self.samples.append({
+                'npy_path': npy_path,
+                'start_sec': start_sec,
+                'end_sec': end_sec,
+                'label': label,
+            })
+
+    def _print_statistics(self):
+        """Print dataset statistics."""
+        total = len(self.samples)
+        if total == 0:
+            print("\nNo samples found in dataset.\n")
+            return
+
+        normal = sum(1 for s in self.samples if s['label'] == 0)
+        abnormal = total - normal
+
+        print(f"\n{'='*50}")
+        print(f"ETRI Feature Dataset")
+        print(f"{'='*50}")
+        print(f"Total samples: {total}")
+        print(f"  Normal:   {normal} ({100*normal/total:.1f}%)")
+        print(f"  Abnormal: {abnormal} ({100*abnormal/total:.1f}%)")
+        if self.strict_normal_sampling and self._discarded_post_event > 0:
+            print(f"  Discarded (post-event noise): {self._discarded_post_event}")
+        print(f"Unit duration: {self.unit_duration}s")
+        print(f"Overlap ratio: {self.overlap_ratio:.1%}")
+        print(f"Strict normal sampling: {self.strict_normal_sampling}")
+        print(f"{'='*50}\n")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        """
+        Get a sample.
+
+        Returns:
+            Tuple of (feature_tensor [T_window, D], label).
+        """
+        sample = self.samples[idx]
+        feat = np.load(sample['npy_path'], mmap_mode='r')
+        window = feat[sample['start_sec']:sample['end_sec']]  # (unit_duration, D)
+        feature_tensor = torch.from_numpy(np.array(window)).float()
+        return feature_tensor, sample['label']
+
+    def get_sample_info(self, idx: int) -> Dict:
+        """Get metadata for a sample."""
+        return self.samples[idx].copy()
+
+    def get_class_weights(self) -> torch.Tensor:
+        """Compute class weights for handling imbalance."""
+        labels = [s['label'] for s in self.samples]
+        from utils import compute_class_weights
+        return compute_class_weights(labels, num_classes=2)
+
+
 class UCFCrimeSpottingInferenceDataset(Dataset):
     """
     Simplified dataset for inference on a single video.

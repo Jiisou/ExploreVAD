@@ -303,6 +303,7 @@ def train(
         embed_dim=model_cfg.embed_dim,
         dropout_rate=model_cfg.dropout_rate,
         temporal_agg=model_cfg.temporal_agg,
+        backend=model_cfg.backend,
     )
     model = model.to(device)
 
@@ -389,7 +390,7 @@ def train(
         train_cfg.checkpoint_dir,
         f"{train_cfg.save_name}_{total_epochs}ep_{timestamp}.pth",
     )
-    save_checkpoint(model, optimizer_p2, total_epochs, val_loss, val_auc, final_path)
+    save_checkpoint(model, optimizer_p1, total_epochs, val_loss, val_auc, final_path)
 
     # Log hyperparameters and final metrics
     writer.add_hparams(
@@ -429,8 +430,10 @@ def parse_args():
     )
 
     # Model selection
-    parser.add_argument("--model-name", type=str, default="ViT-B-32",
+    parser.add_argument("--model-name", type=str, default="MobileCLIP-S0",
                         help=f"CLIP model name. Registry: {list(CLIP_MODEL_REGISTRY.keys())}")
+    parser.add_argument("--mobileclip-weights", type=str, default=None,
+                        help="Path to MobileCLIP v1 pretrained .pt file (required for v1 models)")
     parser.add_argument("--temporal-agg", type=str, default="mean",
                         choices=["mean", "max", "attention"],
                         help="Temporal aggregation method")
@@ -488,6 +491,13 @@ def main():
 
     model_cfg = get_spotting_config(args.model_name)
     model_cfg.temporal_agg = args.temporal_agg
+
+    # Override pretrained path for MobileCLIP v1
+    if args.mobileclip_weights and model_cfg.backend == "mobileclip_v1":
+        model_cfg.pretrained = args.mobileclip_weights
+    elif model_cfg.backend == "mobileclip_v1" and not model_cfg.pretrained:
+        print("Error: MobileCLIP v1 requires --mobileclip-weights /path/to/weights.pt")
+        return
 
     data_cfg = SpottingDataConfig(
         train_root=args.train_root,

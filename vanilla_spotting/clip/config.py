@@ -13,20 +13,79 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 
-# CLIP model registry: model_name -> (open_clip_name, pretrained_tag, embed_dim)
-CLIP_MODEL_REGISTRY: Dict[str, Tuple[str, str, int]] = {
-    # OpenAI CLIP models via open_clip
-    "ViT-B-32": ("ViT-B-32", "openai", 512),
-    "ViT-B-16": ("ViT-B-16", "openai", 512),
-    "ViT-L-14": ("ViT-L-14", "openai", 768),
-    # LAION-trained variants
-    "ViT-B-16-laion2b": ("ViT-B-16", "laion2b_s34b_b88k", 512),
-    "ViT-L-14-laion2b": ("ViT-L-14", "laion2b_s32b_b82k", 768),
-    # MobileCLIP models via open_clip
-    "MobileCLIP-S0": ("MobileCLIP-S0", "datacompdr", 512),
-    "MobileCLIP-S1": ("MobileCLIP-S1", "datacompdr", 512),
-    "MobileCLIP-S2": ("MobileCLIP-S2", "datacompdr", 1024),
-    "MobileCLIP-B": ("MobileCLIP-B", "datacompdr_lt", 512),
+# CLIP model registry: model_name -> {backend, model_name, pretrained, embed_dim}
+# backend: "open_clip" (ViT, MobileCLIP v2) or "mobileclip_v1" (MobileCLIP v1 series)
+CLIP_MODEL_REGISTRY: Dict[str, Dict] = {
+    # --- OpenAI CLIP models via open_clip ---
+    "ViT-B-32": {
+        "backend": "open_clip",
+        "model_name": "ViT-B-32",
+        "pretrained": "openai",
+        "embed_dim": 512,
+    },
+    "ViT-B-16": {
+        "backend": "open_clip",
+        "model_name": "ViT-B-16",
+        "pretrained": "openai",
+        "embed_dim": 512,
+    },
+    "ViT-L-14": {
+        "backend": "open_clip",
+        "model_name": "ViT-L-14",
+        "pretrained": "openai",
+        "embed_dim": 768,
+    },
+    # --- LAION-trained variants via open_clip ---
+    "ViT-B-16-laion2b": {
+        "backend": "open_clip",
+        "model_name": "ViT-B-16",
+        "pretrained": "laion2b_s34b_b88k",
+        "embed_dim": 512,
+    },
+    "ViT-L-14-laion2b": {
+        "backend": "open_clip",
+        "model_name": "ViT-L-14",
+        "pretrained": "laion2b_s32b_b82k",
+        "embed_dim": 768,
+    },
+    # --- MobileCLIP v1 via mobileclip package ---
+    "MobileCLIP-S0": {
+        "backend": "mobileclip_v1",
+        "model_name": "mobileclip_s0",
+        "pretrained": None,  # .pt path required at runtime
+        "embed_dim": 512,
+    },
+    "MobileCLIP-S1": {
+        "backend": "mobileclip_v1",
+        "model_name": "mobileclip_s1",
+        "pretrained": None,
+        "embed_dim": 512,
+    },
+    "MobileCLIP-S2": {
+        "backend": "mobileclip_v1",
+        "model_name": "mobileclip_s2",
+        "pretrained": None,
+        "embed_dim": 512,
+    },
+    "MobileCLIP-B": {
+        "backend": "mobileclip_v1",
+        "model_name": "mobileclip_b",
+        "pretrained": None,
+        "embed_dim": 512,
+    },
+    # --- MobileCLIP v2 via open_clip ---
+    "MobileCLIP2-S0": {
+        "backend": "open_clip",
+        "model_name": "MobileCLIP2-S0",
+        "pretrained": "dfndr2b",
+        "embed_dim": 512,
+    },
+    "MobileCLIP2-S2": {
+        "backend": "open_clip",
+        "model_name": "MobileCLIP2-S2",
+        "pretrained": "dfndr2b",
+        "embed_dim": 512,
+    },
 }
 
 # CLIP normalization constants (shared across all CLIP variants)
@@ -45,8 +104,9 @@ SPOTTING_CLASSES: List[str] = ["Normal", "Abnormal"]
 class SpottingModelConfig:
     """CLIP-based model configuration for spotting."""
     # Model selection (key into CLIP_MODEL_REGISTRY, or custom open_clip name)
-    name: str = "ViT-B-32"
-    pretrained: str = "openai"  # open_clip pretrained tag
+    name: str = "mobileclip_s0"
+    pretrained: str = ""  # pretrained tag (open_clip) or .pt path (mobileclip v1)
+    backend: str = "mobileclip_v1"  # "open_clip" or "mobileclip_v1"
 
     num_classes: int = 2  # Binary: Normal vs Abnormal
     dropout_rate: float = 0.5
@@ -64,9 +124,12 @@ class SpottingModelConfig:
     temporal_agg: str = "mean"
 
     def __post_init__(self):
-        """Resolve embed_dim from registry if model is registered."""
-        if self.name in CLIP_MODEL_REGISTRY:
-            _, _, self.embed_dim = CLIP_MODEL_REGISTRY[self.name]
+        """Resolve embed_dim and backend from registry if model is registered."""
+        for key, info in CLIP_MODEL_REGISTRY.items():
+            if info["model_name"] == self.name:
+                self.embed_dim = info["embed_dim"]
+                self.backend = info["backend"]
+                break
 
 
 @dataclass
@@ -165,7 +228,7 @@ def get_frame_indices(window_size: int, num_frames: int = FRAMES_PER_UNIT) -> Li
     return indices
 
 
-def get_spotting_config(model_name: str = "ViT-B-32") -> SpottingModelConfig:
+def get_spotting_config(model_name: str = "MobileCLIP-S0") -> SpottingModelConfig:
     """
     Get spotting model configuration.
 
@@ -176,12 +239,13 @@ def get_spotting_config(model_name: str = "ViT-B-32") -> SpottingModelConfig:
         SpottingModelConfig instance.
     """
     if model_name in CLIP_MODEL_REGISTRY:
-        oc_name, pretrained, embed_dim = CLIP_MODEL_REGISTRY[model_name]
+        info = CLIP_MODEL_REGISTRY[model_name]
         return SpottingModelConfig(
-            name=oc_name,
-            pretrained=pretrained,
-            embed_dim=embed_dim,
+            name=info["model_name"],
+            pretrained=info["pretrained"] or "",
+            backend=info["backend"],
+            embed_dim=info["embed_dim"],
         )
 
     # Fallback: use as raw open_clip model name
-    return SpottingModelConfig(name=model_name)
+    return SpottingModelConfig(name=model_name, backend="open_clip")

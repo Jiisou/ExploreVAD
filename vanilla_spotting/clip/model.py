@@ -15,11 +15,19 @@ Architecture:
     Output: (B, 2) logits for Normal/Abnormal
 """
 
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 from typing import Optional
 
 import open_clip
+
+
+class QuickGELU(nn.Module):
+    """CLIP's GELU approximation for representation space consistency."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.sigmoid(1.702 * x)
 
 
 class SpottingModel(nn.Module):
@@ -41,12 +49,13 @@ class SpottingModel(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "ViT-B-32",
-        pretrained: str = "openai",
+        model_name: str = "mobileclip_s0",
+        pretrained: str = "",
         num_classes: int = 2,
         embed_dim: int = 512,
         dropout_rate: float = 0.5,
         temporal_agg: str = "mean",
+        backend: str = "mobileclip_v1",
     ):
         super().__init__()
 
@@ -54,15 +63,26 @@ class SpottingModel(nn.Module):
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.temporal_agg = temporal_agg
+        self.backend = backend
 
-        # Load CLIP model via open_clip (only need vision encoder)
-        print(f"Loading {model_name} (pretrained={pretrained}) via open_clip...")
-        clip_model, _, _ = open_clip.create_model_and_transforms(
-            model_name, pretrained=pretrained,
-        )
+        # Load CLIP vision encoder via appropriate backend
+        if backend == "mobileclip_v1":
+            import mobileclip
+            from mobileclip.modules.common.mobileone import reparameterize_model
 
-        # Extract vision encoder only
-        self.visual = clip_model.visual
+            print(f"Loading {model_name} (pretrained={pretrained}) via mobileclip...")
+            clip_model, _, _ = mobileclip.create_model_and_transforms(
+                model_name, pretrained=pretrained or None,
+            )
+            # TODO: if evaluate, off this line:
+            # clip_model = reparameterize_model(clip_model)
+            self.visual = clip_model.image_encoder
+        else:
+            print(f"Loading {model_name} (pretrained={pretrained}) via open_clip...")
+            clip_model, _, _ = open_clip.create_model_and_transforms(
+                model_name, pretrained=pretrained,
+            )
+            self.visual = clip_model.visual
 
         # Verify embed_dim matches
         # Try a dummy forward to get actual output dim
@@ -190,13 +210,161 @@ class SpottingModel(nn.Module):
         return self.visual.parameters()
 
 
+class FeatureSpottingModel(nn.Module):
+    """
+    Lightweight classification head for pre-extracted features.
+
+    Skips the vision encoder entirely. Input is (B, T, D) feature tensors
+    from pre-extracted .npy files.
+
+    Architecture:
+        Input: (B, T, D) pre-extracted features
+            ↓
+        Temporal Aggregation (mean/max/attention)
+            ↓ (B, D)
+        Classification Head: Linear(D, num_classes)
+            ↓
+        Output: (B, 2) logits
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 512,
+        num_classes: int = 2,
+        dropout_rate: float = 0.5,
+        temporal_agg: str = "mean",
+    ):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.num_classes = num_classes
+        self.temporal_agg = temporal_agg
+
+        if temporal_agg == "attention":
+            self.temporal_attn = nn.MultiheadAttention(
+                embed_dim=embed_dim, num_heads=4, batch_first=True,
+            )
+
+        self.dropout = nn.Dropout(dropout_rate)
+        self.head = nn.Linear(embed_dim, num_classes)
+
+        print(f"FeatureSpottingModel created:")
+        print(f"  Embed dim: {embed_dim}")
+        print(f"  Temporal aggregation: {temporal_agg}")
+        print(f"  Head: Linear({embed_dim}, {num_classes})")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: (B, T, D) pre-extracted feature tensor.
+
+        Returns:
+            (B, num_classes) logits.
+        """
+        if self.temporal_agg == "mean":
+            pooled = x.mean(dim=1)
+        elif self.temporal_agg == "max":
+            pooled = x.max(dim=1).values
+        elif self.temporal_agg == "attention":
+            attn_out, _ = self.temporal_attn(x, x, x)
+            pooled = attn_out.mean(dim=1)
+        else:
+            raise ValueError(f"Unknown temporal aggregation: {self.temporal_agg}")
+
+        pooled = self.dropout(pooled)
+        logits = self.head(pooled)
+        return logits
+
+
+class ResidualMLPSpottingModel(nn.Module):
+    """
+    CLIP-style residual MLP head for pre-extracted features.
+
+    Architecture:
+        Input: (B, T, D) pre-extracted features
+            ↓
+        Temporal Aggregation (mean/max/attention)
+            ↓ (B, D)
+        Residual MLP: x + MLP(x)
+            where MLP = Linear(D, 4D) → QuickGELU → Linear(4D, D)
+            ↓ (B, D)
+        Classifier: Linear(D, 1)
+            ↓
+        Output: (B, 1) logit  (use BCEWithLogitsLoss)
+
+    The residual MLP and QuickGELU preserve consistency with CLIP's
+    internal representation space.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 512,
+        dropout_rate: float = 0.5,
+        temporal_agg: str = "mean",
+    ):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.temporal_agg = temporal_agg
+
+        if temporal_agg == "attention":
+            self.temporal_attn = nn.MultiheadAttention(
+                embed_dim=embed_dim, num_heads=4, batch_first=True,
+            )
+
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(embed_dim, embed_dim * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(embed_dim * 4, embed_dim)),
+        ]))
+
+        self.dropout = nn.Dropout(dropout_rate)
+        self.classifier = nn.Linear(embed_dim, 1)
+
+        print(f"ResidualMLPSpottingModel created:")
+        print(f"  Embed dim: {embed_dim}")
+        print(f"  Temporal aggregation: {temporal_agg}")
+        print(f"  MLP: Linear({embed_dim}, {embed_dim*4}) → QuickGELU → Linear({embed_dim*4}, {embed_dim})")
+        print(f"  Classifier: Linear({embed_dim}, 1)")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: (B, T, D) pre-extracted feature tensor.
+
+        Returns:
+            (B, 1) logit (apply sigmoid for probability).
+        """
+        # Temporal aggregation
+        if self.temporal_agg == "mean":
+            pooled = x.mean(dim=1)
+        elif self.temporal_agg == "max":
+            pooled = x.max(dim=1).values
+        elif self.temporal_agg == "attention":
+            attn_out, _ = self.temporal_attn(x, x, x)
+            pooled = attn_out.mean(dim=1)
+        else:
+            raise ValueError(f"Unknown temporal aggregation: {self.temporal_agg}")
+
+        pooled = self.dropout(pooled)
+
+        # Residual MLP + classifier
+        logit = self.classifier(pooled + self.mlp(pooled))
+        return logit
+
+
 def create_spotting_model(
-    model_name: str = "ViT-B-32",
-    pretrained: str = "openai",
+    model_name: str = "mobileclip_s0",
+    pretrained: str = "",
     num_classes: int = 2,
     embed_dim: int = 512,
     dropout_rate: float = 0.5,
     temporal_agg: str = "mean",
+    backend: str = "mobileclip_v1",
     checkpoint_path: Optional[str] = None,
     device: Optional[torch.device] = None,
 ) -> SpottingModel:
@@ -204,25 +372,32 @@ def create_spotting_model(
     Create and optionally load a SpottingModel.
 
     Args:
-        model_name: open_clip model name.
-        pretrained: open_clip pretrained tag.
+        model_name: Model name (open_clip name or mobileclip name).
+        pretrained: Pretrained tag (open_clip) or .pt path (mobileclip v1).
         num_classes: Number of output classes.
         embed_dim: Embedding dimension.
         dropout_rate: Dropout rate.
         temporal_agg: Temporal aggregation method.
-        checkpoint_path: Optional path to load trained weights from.
+        backend: Loading backend ("open_clip" or "mobileclip_v1").
+        checkpoint_path: Optional path to load trained spotting model weights.
         device: Device to load model to.
 
     Returns:
         SpottingModel instance.
     """
+    # For open_clip backend, skip pretrained weights when loading our own checkpoint
+    # For mobileclip_v1, always need pretrained to create architecture
+    if checkpoint_path is not None and backend == "open_clip":
+        pretrained = ""
+
     model = SpottingModel(
         model_name=model_name,
-        pretrained=pretrained if checkpoint_path is None else "",
+        pretrained=pretrained,
         num_classes=num_classes,
         embed_dim=embed_dim,
         dropout_rate=dropout_rate,
         temporal_agg=temporal_agg,
+        backend=backend,
     )
 
     if checkpoint_path is not None:
@@ -254,6 +429,7 @@ if __name__ == "__main__":
         pretrained="openai",
         num_classes=2,
         embed_dim=512,
+        backend="open_clip",
     )
 
     # Test forward pass: (B, C, T, H, W)

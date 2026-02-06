@@ -7,6 +7,9 @@ Metrics:
 - AUC-ROC (primary metric)
 - Precision, Recall, F1 at optimal threshold
 - Per-video aggregated anomaly score
+
+Quick Start:
+python vanilla_spotting/clip/evaluate.py --checkpoint /mnt/c/Users/USER/Desktop/ExploreVAD/vanilla_spotting/clip/checkpoints/spotting_clip_best.pth --max-videos-per-class 5
 """
 
 import argparse
@@ -370,6 +373,7 @@ def evaluate(
         num_classes=model_cfg.num_classes,
         embed_dim=model_cfg.embed_dim,
         temporal_agg=model_cfg.temporal_agg,
+        backend=model_cfg.backend,
         checkpoint_path=checkpoint_path,
         device=device,
     )
@@ -419,8 +423,10 @@ def parse_args():
 
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint")
-    parser.add_argument("--model-name", type=str, default="ViT-B-32",
+    parser.add_argument("--model-name", type=str, default="MobileCLIP-S0",
                         help=f"CLIP model name. Registry: {list(CLIP_MODEL_REGISTRY.keys())}")
+    parser.add_argument("--mobileclip-weights", type=str, default=None,
+                        help="Path to MobileCLIP v1 pretrained .pt file (required for v1 models)")
     parser.add_argument("--temporal-agg", type=str, default="mean",
                         choices=["mean", "max", "attention"],
                         help="Temporal aggregation method")
@@ -446,6 +452,15 @@ def main():
 
     model_cfg = get_spotting_config(args.model_name)
     model_cfg.temporal_agg = args.temporal_agg
+
+    if model_cfg.backend == "mobileclip_v1":
+        model_cfg.pretrained = "/home/etri/.cache/huggingface/hub/models--apple--MobileCLIP-S0/snapshots/71aa3e13dda93115871afbd017336535ba29886c/mobileclip_s0.pt"
+    # Override pretrained path for MobileCLIP v1
+    # if args.mobileclip_weights and model_cfg.backend == "mobileclip_v1":
+    #     model_cfg.pretrained = args.mobileclip_weights
+    # elif model_cfg.backend == "mobileclip_v1" and not model_cfg.pretrained:
+    #     print("Error: MobileCLIP v1 requires --mobileclip-weights /path/to/weights.pt")
+    #     return
 
     data_cfg = SpottingDataConfig(
         test_root=args.test_root,
