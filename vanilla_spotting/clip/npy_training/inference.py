@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Inference script for pre-extracted npy features (ETRI dataset).
+Inference script for pre-extracted npy features.
 
 Uses FeatureSpottingModel (temporal aggregation + classification head only).
 

@@ -1,0 +1,4 @@
+opencv-python
+git+https://github.com/apple/ml-mobileclip.git   
+open_clip_torch
+tqdm

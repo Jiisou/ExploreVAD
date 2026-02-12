@@ -30,7 +30,7 @@ import numpy as np
 
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-from dataset import ETRIFeatureDataset
+from dataset import NPYFeatureDataset
 from model import ResidualMLPSpottingModel
 from utils import (
     set_seed,
@@ -136,7 +136,7 @@ def validate(
     return loss_meter.avg, accuracy, auc
 
 
-def compute_pos_weight(dataset: ETRIFeatureDataset) -> torch.Tensor:
+def compute_pos_weight(dataset: NPYFeatureDataset) -> torch.Tensor:
     """
     Compute pos_weight for BCEWithLogitsLoss.
 
@@ -160,6 +160,7 @@ def compute_pos_weight(dataset: ETRIFeatureDataset) -> torch.Tensor:
 def train(
     feature_dir: str,
     annotation_dir: str,
+    dataset_name: str,
     embed_dim: int = 512,
     unit_duration: int = 2,
     overlap_ratio: float = 0.5,
@@ -172,10 +173,10 @@ def train(
     weight_decay: float = 1e-4,
     warmup_epochs: int = 2,
     patience: int = 5,
-    checkpoint_dir: str = "./checkpoints",
+    checkpoint_dir: str = "./vanilla_spotting/clip/npy_training/checkpoints",
     save_name: str = "resmlp_spotting",
     save_interval: int = 5,
-    log_dir: str = "./runs",
+    log_dir: str = "./vanilla_spotting/clip/npy_training/runs",
     val_split: float = 0.1,
     seed: int = 42,
     resume_ckpt: str = None,
@@ -193,7 +194,7 @@ def train(
 
     # Create dataset
     print("\nLoading dataset...")
-    full_dataset = ETRIFeatureDataset(
+    full_dataset = NPYFeatureDataset(
         feature_dir=feature_dir,
         annotation_dir=annotation_dir,
         unit_duration=unit_duration,
@@ -244,6 +245,7 @@ def train(
     pos_weight = compute_pos_weight(full_dataset).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
+    checkpoint_dir = os.path.join(checkpoint_dir, f"{dataset_name}_resmlp")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Optimizer and scheduler
@@ -301,7 +303,7 @@ def train(
 
         if val_auc > best_auc:
             best_auc = val_auc
-            save_path = os.path.join(checkpoint_dir, f"{save_name}_best.pth")
+            save_path = os.path.join(checkpoint_dir, f"{save_name}_best_{epoch+1}.pth")
             save_checkpoint(model, optimizer, epoch, val_loss, val_auc, save_path)
 
         if (epoch + 1) % save_interval == 0:
@@ -316,7 +318,7 @@ def train(
 
     # Save final
     final_path = os.path.join(
-        checkpoint_dir, f"{save_name}_{epochs}ep_{timestamp}.pth",
+        checkpoint_dir, f"{dataset_name}_resmlp/{save_name}_{epochs}ep.pth",
     )
     save_checkpoint(model, optimizer, epochs, val_loss, val_auc, final_path)
 
@@ -359,6 +361,8 @@ def parse_args():
                         help="Path to feature directory (e.g., .../MCi2-S0-6/train)")
     parser.add_argument("--annotation-dir", type=str, required=True,
                         help="Path to annotation directory with *_timestamp.csv files")
+    parser.add_argument("--dataset-name", type=str, required=True,
+                        help="Name of the dataset")
 
     # Model
     parser.add_argument("--embed-dim", type=int, default=512,
@@ -392,7 +396,7 @@ def parse_args():
                         help="Early stopping patience")
 
     # Output
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints/etri_resmlp",
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints",
                         help="Checkpoint save directory")
     parser.add_argument("--save-name", type=str, default="resmlp_spotting",
                         help="Base name for saved models")
@@ -432,6 +436,7 @@ def main():
     train(
         feature_dir=args.feature_dir,
         annotation_dir=args.annotation_dir,
+        dataset_name=args.dataset_name,
         embed_dim=args.embed_dim,
         unit_duration=args.unit_duration,
         overlap_ratio=args.overlap_ratio,
