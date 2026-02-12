@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Evaluation script for pre-extracted npy features (ETRI dataset).
+Evaluation script for pre-extracted npy features.
 
 Uses FeatureSpottingModel (temporal aggregation + classification head only).
 
@@ -33,7 +33,7 @@ from scipy.ndimage import gaussian_filter1d
 
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-from dataset import ETRIFeatureDataset
+from dataset import NPYFeatureDataset
 from model import FeatureSpottingModel, ResidualMLPSpottingModel
 from utils import set_seed, get_device, load_checkpoint
 from config import SPOTTING_CLASSES
@@ -167,7 +167,7 @@ def compute_metrics(
 
 
 def compute_per_class_metrics(
-    dataset: ETRIFeatureDataset,
+    dataset: NPYFeatureDataset,
     preds: np.ndarray,
     labels: np.ndarray,
     probs: np.ndarray,
@@ -179,7 +179,7 @@ def compute_per_class_metrics(
     accuracy, precision, recall, F1 for each class.
 
     Args:
-        dataset: ETRIFeatureDataset instance.
+        dataset: NPYFeatureDataset instance.
         preds: Predicted labels (0 or 1).
         labels: Ground truth labels (0 or 1).
         probs: Anomaly probabilities.
@@ -301,7 +301,7 @@ def print_per_class_report(class_metrics: Dict[str, Dict]):
 
 
 def aggregate_by_file(
-    dataset: ETRIFeatureDataset,
+    dataset: NPYFeatureDataset,
     probs: np.ndarray,
     labels: np.ndarray,
     logits_normal: np.ndarray = None,
@@ -335,9 +335,18 @@ def aggregate_by_file(
         probs_arr = np.array(file_scores[npy_path]['probs'])
         labels_arr = np.array(file_scores[npy_path]['labels'])
 
-        # Calculate segment-level accuracy (threshold at 0.5)
+        # Calculate segment-level accuracy and F1 (threshold at 0.5)
         preds_arr = (probs_arr >= 0.5).astype(int)
         segment_acc = np.mean(preds_arr == labels_arr)
+
+        # Segment-level F1 for anomaly class
+        tp = int(np.sum((preds_arr == 1) & (labels_arr == 1)))
+        fp = int(np.sum((preds_arr == 1) & (labels_arr == 0)))
+        fn = int(np.sum((preds_arr == 0) & (labels_arr == 1)))
+        seg_precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        seg_recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        segment_f1 = (2 * seg_precision * seg_recall / (seg_precision + seg_recall)
+                       if (seg_precision + seg_recall) > 0 else 0.0)
 
         file_scores[npy_path].update({
             'max_prob': np.max(probs_arr),
@@ -346,6 +355,9 @@ def aggregate_by_file(
             'num_anomaly_segments': int(np.sum(labels_arr)),
             'file_label': 1 if np.any(labels_arr == 1) else 0,
             'segment_acc': segment_acc,
+            'segment_f1': segment_f1,
+            'segment_precision': seg_precision,
+            'segment_recall': seg_recall,
         })
 
     return file_scores
@@ -365,7 +377,7 @@ def plot_roc_curve(labels: np.ndarray, probs: np.ndarray, save_path: str):
     plt.plot([0, 1], [0, 1], 'k--', linewidth=1)
     plt.xlabel('False Positive Rate', fontsize=12)
     plt.ylabel('True Positive Rate', fontsize=12)
-    plt.title('ROC Curve - Feature Anomaly Spotting (ETRI)', fontsize=14)
+    plt.title('ROC Curve - Feature Anomaly Spotting ', fontsize=14)
     plt.legend(loc='lower right', fontsize=11)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -386,7 +398,7 @@ def plot_precision_recall_curve(labels: np.ndarray, probs: np.ndarray, save_path
     plt.plot(recall, precision, 'b-', linewidth=2)
     plt.xlabel('Recall', fontsize=12)
     plt.ylabel('Precision', fontsize=12)
-    plt.title('Precision-Recall Curve - Feature Anomaly Spotting (ETRI)', fontsize=14)
+    plt.title('Precision-Recall Curve - Feature Anomaly Spotting ', fontsize=14)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
@@ -423,7 +435,7 @@ def plot_confusion_matrix(cm: np.ndarray, save_path: str):
 
     ax.set_ylabel('True Label', fontsize=12)
     ax.set_xlabel('Predicted Label', fontsize=12)
-    ax.set_title('Confusion Matrix - Feature Anomaly Spotting (ETRI)', fontsize=14)
+    ax.set_title('Confusion Matrix - Feature Anomaly Spotting', fontsize=14)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
@@ -482,7 +494,7 @@ def plot_file_timeline(file_scores: Dict, npy_path: str, save_dir: str = "./time
 def print_metrics_report(metrics: Dict):
     """Print formatted metrics report."""
     print("\n" + "=" * 60)
-    print("EVALUATION RESULTS (ETRI Feature)")
+    print("EVALUATION RESULTS ")
     print("=" * 60)
 
     print(f"\n[Segment-Level Metrics]")
@@ -514,6 +526,190 @@ def print_metrics_report(metrics: Dict):
     print(f"       Abnormal   {cm[1, 0]:5d}   {cm[1, 1]:5d}")
 
     print("\n" + "=" * 60)
+
+
+def compute_video_level_metrics(
+    file_scores: Dict[str, Dict],
+    agg_method: str = "max",
+    threshold: float = 0.5,
+) -> Dict:
+    """
+    Compute video-level (file-level) evaluation metrics.
+
+    Args:
+        file_scores: Dictionary from aggregate_by_file().
+        agg_method: Aggregation method for video-level score.
+            - "max": Max probability across segments (common for anomaly detection)
+            - "mean": Mean probability across segments
+            - "any": 1 if any segment prob >= threshold, else 0
+        threshold: Threshold for binary prediction.
+
+    Returns:
+        Dictionary with video-level metrics.
+    """
+    video_labels = []
+    video_probs = []
+    video_preds = []
+
+    for npy_path, data in file_scores.items():
+        # Ground truth: 1 if any segment is anomaly
+        gt_label = data['file_label']
+        video_labels.append(gt_label)
+
+        # Aggregated probability
+        if agg_method == "max":
+            agg_prob = data['max_prob']
+        elif agg_method == "mean":
+            agg_prob = data['mean_prob']
+        elif agg_method == "any":
+            agg_prob = 1.0 if data['max_prob'] >= threshold else 0.0
+        else:
+            agg_prob = data['max_prob']
+
+        video_probs.append(agg_prob)
+        video_preds.append(1 if agg_prob >= threshold else 0)
+
+    video_labels = np.array(video_labels)
+    video_probs = np.array(video_probs)
+    video_preds = np.array(video_preds)
+
+    # Accuracy
+    accuracy = accuracy_score(video_labels, video_preds)
+
+    # AUC-ROC
+    if len(np.unique(video_labels)) > 1:
+        auc_roc = roc_auc_score(video_labels, video_probs)
+    else:
+        auc_roc = float('nan')
+
+    # Confusion matrix
+    cm = confusion_matrix(video_labels, video_preds)
+
+    # Precision, Recall, F1
+    if len(np.unique(video_labels)) > 1 and len(np.unique(video_preds)) > 1:
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            video_labels, video_preds, average='binary', zero_division=0
+        )
+    else:
+        precision = recall = f1 = float('nan')
+
+    # Optimal threshold via Youden's J
+    if len(np.unique(video_labels)) > 1:
+        fpr, tpr, thresholds = roc_curve(video_labels, video_probs)
+        j_scores = tpr - fpr
+        optimal_idx = np.argmax(j_scores)
+        optimal_threshold = thresholds[optimal_idx]
+
+        optimal_preds = (video_probs >= optimal_threshold).astype(int)
+        opt_precision, opt_recall, opt_f1, _ = precision_recall_fscore_support(
+            video_labels, optimal_preds, average='binary', zero_division=0
+        )
+    else:
+        optimal_threshold = threshold
+        opt_precision = opt_recall = opt_f1 = float('nan')
+
+    # Per-class breakdown
+    n_total = len(video_labels)
+    n_anomaly_videos = int(np.sum(video_labels))
+    n_normal_videos = n_total - n_anomaly_videos
+
+    tp = int(np.sum((video_preds == 1) & (video_labels == 1)))
+    fp = int(np.sum((video_preds == 1) & (video_labels == 0)))
+    tn = int(np.sum((video_preds == 0) & (video_labels == 0)))
+    fn = int(np.sum((video_preds == 0) & (video_labels == 1)))
+
+    return {
+        'accuracy': accuracy,
+        'auc_roc': auc_roc,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'confusion_matrix': cm,
+        'optimal_threshold': optimal_threshold,
+        'opt_precision': opt_precision,
+        'opt_recall': opt_recall,
+        'opt_f1': opt_f1,
+        'n_total': n_total,
+        'n_anomaly_videos': n_anomaly_videos,
+        'n_normal_videos': n_normal_videos,
+        'tp': tp,
+        'fp': fp,
+        'tn': tn,
+        'fn': fn,
+        'agg_method': agg_method,
+        'threshold': threshold,
+        'video_labels': video_labels,
+        'video_probs': video_probs,
+        'video_preds': video_preds,
+    }
+
+
+def print_video_level_report(metrics: Dict):
+    """Print video-level evaluation report."""
+    print("\n" + "=" * 70)
+    print("VIDEO-LEVEL EVALUATION RESULTS")
+    print("=" * 70)
+
+    print(f"\nAggregation Method: {metrics['agg_method'].upper()}")
+    print(f"Threshold: {metrics['threshold']:.2f}")
+    print(f"Total Videos: {metrics['n_total']} "
+          f"(Anomaly: {metrics['n_anomaly_videos']}, Normal: {metrics['n_normal_videos']})")
+
+    print(f"\n[Video-Level Metrics @ threshold={metrics['threshold']:.2f}]")
+    print(f"  Accuracy:    {metrics['accuracy']:.4f}")
+    auc_str = f"{metrics['auc_roc']:.4f}" if not np.isnan(metrics['auc_roc']) else "N/A"
+    print(f"  AUC-ROC:     {auc_str}")
+    prec_str = f"{metrics['precision']:.4f}" if not np.isnan(metrics['precision']) else "N/A"
+    rec_str = f"{metrics['recall']:.4f}" if not np.isnan(metrics['recall']) else "N/A"
+    f1_str = f"{metrics['f1']:.4f}" if not np.isnan(metrics['f1']) else "N/A"
+    print(f"  Precision:   {prec_str}")
+    print(f"  Recall:      {rec_str}")
+    print(f"  F1 Score:    {f1_str}")
+
+    print(f"\n[Optimal Threshold: {metrics['optimal_threshold']:.4f}]")
+    opt_prec_str = f"{metrics['opt_precision']:.4f}" if not np.isnan(metrics['opt_precision']) else "N/A"
+    opt_rec_str = f"{metrics['opt_recall']:.4f}" if not np.isnan(metrics['opt_recall']) else "N/A"
+    opt_f1_str = f"{metrics['opt_f1']:.4f}" if not np.isnan(metrics['opt_f1']) else "N/A"
+    print(f"  Precision:   {opt_prec_str}")
+    print(f"  Recall:      {opt_rec_str}")
+    print(f"  F1 Score:    {opt_f1_str}")
+
+    print(f"\n[Confusion Matrix (Video-Level)]")
+    print(f"                Predicted")
+    print(f"              Normal  Anomaly")
+    print(f"  Actual Normal   {metrics['tn']:5d}   {metrics['fp']:5d}")
+    print(f"       Anomaly    {metrics['fn']:5d}   {metrics['tp']:5d}")
+
+    print("\n" + "=" * 70)
+
+
+def plot_video_level_roc(
+    video_metrics: Dict,
+    save_path: str,
+):
+    """Plot and save video-level ROC curve."""
+    labels = video_metrics['video_labels']
+    probs = video_metrics['video_probs']
+
+    if len(np.unique(labels)) <= 1:
+        print("Cannot plot video-level ROC curve: only one class present")
+        return
+
+    fpr, tpr, _ = roc_curve(labels, probs)
+    auc = video_metrics['auc_roc']
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, 'b-', linewidth=2, label=f'Video-Level AUC = {auc:.4f}')
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1)
+    plt.xlabel('False Positive Rate', fontsize=12)
+    plt.ylabel('True Positive Rate', fontsize=12)
+    plt.title(f'Video-Level ROC Curve (Agg: {video_metrics["agg_method"]})', fontsize=14)
+    plt.legend(loc='lower right', fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"Video-level ROC curve saved to {save_path}")
 
 
 def select_files_per_class(
@@ -605,6 +801,231 @@ def select_files_per_class(
     return [npy_path for npy_path, _ in selected]
 
 
+def compute_anomaly_only_auc(
+    file_scores: Dict[str, Dict],
+) -> Dict:
+    """
+    Compute Ano-AUC at both segment-level and video-level.
+
+    Filters to videos where file_label == 1 (anomaly-containing videos only).
+
+    Segment-level Ano-AUC:
+        Pool all segments from anomaly videos and compute a single AUC.
+        Measures overall temporal localization across all anomaly videos.
+
+    Video-level Ano-AUC:
+        Compute per-video AUC (requires both normal and anomaly segments
+        within a single video), then macro-average across videos.
+        Measures per-video temporal localization quality.
+
+    Returns:
+        Dictionary with segment/video-level Ano-AUC, per-video AUC list, etc.
+    """
+    all_probs = []
+    all_labels = []
+    per_video_auc = []  # (npy_path, auc, n_segments, n_anomaly, n_normal, f1)
+
+    for npy_path, data in file_scores.items():
+        if data['file_label'] != 1:
+            continue
+
+        probs_arr = np.array(data['probs'])
+        labels_arr = np.array(data['labels'])
+        all_probs.extend(probs_arr)
+        all_labels.extend(labels_arr)
+
+        # Per-video AUC (only computable if video has both classes)
+        if len(np.unique(labels_arr)) > 1:
+            vid_auc = roc_auc_score(labels_arr, probs_arr)
+        else:
+            vid_auc = float('nan')
+
+        per_video_auc.append({
+            'npy_path': npy_path,
+            'auc': vid_auc,
+            'n_segments': len(probs_arr),
+            'n_anomaly': int(np.sum(labels_arr)),
+            'n_normal': int(np.sum(labels_arr == 0)),
+            'segment_f1': data['segment_f1'],
+            'segment_acc': data['segment_acc'],
+        })
+
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+
+    n_anomaly_videos = len(per_video_auc)
+    n_total_segments = len(all_labels)
+    n_anomaly_segments = int(np.sum(all_labels))
+    n_normal_segments = n_total_segments - n_anomaly_segments
+
+    # --- Segment-level Ano-AUC (pooled) ---
+    if len(np.unique(all_labels)) > 1:
+        seg_ano_auc = roc_auc_score(all_labels, all_probs)
+    else:
+        seg_ano_auc = float('nan')
+
+    # Optimal threshold within anomaly videos (segment-level)
+    if len(np.unique(all_labels)) > 1:
+        fpr, tpr, thresholds = roc_curve(all_labels, all_probs)
+        j_scores = tpr - fpr
+        optimal_idx = np.argmax(j_scores)
+        optimal_threshold = thresholds[optimal_idx]
+
+        optimal_preds = (all_probs >= optimal_threshold).astype(int)
+        opt_precision, opt_recall, opt_f1, _ = precision_recall_fscore_support(
+            all_labels, optimal_preds, average='binary', zero_division=0
+        )
+    else:
+        optimal_threshold = 0.5
+        opt_precision = opt_recall = opt_f1 = float('nan')
+
+    # Default threshold metrics (segment-level)
+    preds_05 = (all_probs >= 0.5).astype(int)
+    if len(np.unique(all_labels)) > 1:
+        prec_05, rec_05, f1_05, _ = precision_recall_fscore_support(
+            all_labels, preds_05, average='binary', zero_division=0
+        )
+    else:
+        prec_05 = rec_05 = f1_05 = float('nan')
+
+    # --- Video-level Ano-AUC (macro-average of per-video AUCs) ---
+    valid_aucs = [v['auc'] for v in per_video_auc if not np.isnan(v['auc'])]
+    vid_ano_auc_macro = np.mean(valid_aucs) if valid_aucs else float('nan')
+    vid_ano_auc_std = np.std(valid_aucs) if valid_aucs else float('nan')
+    n_valid_videos = len(valid_aucs)
+    n_skipped_videos = n_anomaly_videos - n_valid_videos
+
+    return {
+        # Segment-level
+        'seg_ano_auc': seg_ano_auc,
+        'optimal_threshold': optimal_threshold,
+        'opt_precision': opt_precision,
+        'opt_recall': opt_recall,
+        'opt_f1': opt_f1,
+        'precision_05': prec_05,
+        'recall_05': rec_05,
+        'f1_05': f1_05,
+        # Video-level
+        'vid_ano_auc_macro': vid_ano_auc_macro,
+        'vid_ano_auc_std': vid_ano_auc_std,
+        'n_valid_videos': n_valid_videos,
+        'n_skipped_videos': n_skipped_videos,
+        # Counts
+        'n_anomaly_videos': n_anomaly_videos,
+        'n_total_segments': n_total_segments,
+        'n_anomaly_segments': n_anomaly_segments,
+        'n_normal_segments': n_normal_segments,
+        # Per-video breakdown
+        'per_video_auc': per_video_auc,
+    }
+
+
+def print_anomaly_only_report(ano_metrics: Dict, top_k: int = 0):
+    """Print Ano-AUC evaluation report (segment + video level)."""
+    print("\n" + "=" * 70)
+    print("ANOMALY-ONLY EVALUATION (Ano-AUC)")
+    print("=" * 70)
+
+    print(f"\nScope: {ano_metrics['n_anomaly_videos']} anomaly videos, "
+          f"{ano_metrics['n_total_segments']} total segments "
+          f"(anomaly: {ano_metrics['n_anomaly_segments']}, "
+          f"normal: {ano_metrics['n_normal_segments']})")
+
+    # --- Segment-level ---
+    print(f"\n[Segment-Level Ano-AUC (pooled)]")
+    auc_str = f"{ano_metrics['seg_ano_auc']:.4f}" if not np.isnan(ano_metrics['seg_ano_auc']) else "N/A"
+    print(f"  Ano-AUC:     {auc_str}")
+
+    print(f"  @ threshold=0.5:")
+    print(f"    Precision: {ano_metrics['precision_05']:.4f}")
+    print(f"    Recall:    {ano_metrics['recall_05']:.4f}")
+    print(f"    F1:        {ano_metrics['f1_05']:.4f}")
+
+    print(f"  @ optimal threshold={ano_metrics['optimal_threshold']:.4f}:")
+    opt_p = f"{ano_metrics['opt_precision']:.4f}" if not np.isnan(ano_metrics['opt_precision']) else "N/A"
+    opt_r = f"{ano_metrics['opt_recall']:.4f}" if not np.isnan(ano_metrics['opt_recall']) else "N/A"
+    opt_f = f"{ano_metrics['opt_f1']:.4f}" if not np.isnan(ano_metrics['opt_f1']) else "N/A"
+    print(f"    Precision: {opt_p}")
+    print(f"    Recall:    {opt_r}")
+    print(f"    F1:        {opt_f}")
+
+    # --- Video-level ---
+    print(f"\n[Video-Level Ano-AUC (macro-avg of per-video AUC)]")
+    vid_auc_str = (f"{ano_metrics['vid_ano_auc_macro']:.4f}"
+                   if not np.isnan(ano_metrics['vid_ano_auc_macro']) else "N/A")
+    vid_std_str = (f"{ano_metrics['vid_ano_auc_std']:.4f}"
+                   if not np.isnan(ano_metrics['vid_ano_auc_std']) else "N/A")
+    print(f"  Ano-AUC:     {vid_auc_str} (+/- {vid_std_str})")
+    print(f"  Valid videos: {ano_metrics['n_valid_videos']} / {ano_metrics['n_anomaly_videos']}"
+          f"  (skipped {ano_metrics['n_skipped_videos']} single-class videos)")
+
+    # --- Top-k per-video AUC ---
+    if top_k > 0:
+        per_video = ano_metrics['per_video_auc']
+        # Sort by AUC descending (NaN goes last)
+        ranked = sorted(per_video, key=lambda v: v['auc'] if not np.isnan(v['auc']) else -1, reverse=True)
+        show = ranked[:top_k]
+
+        print(f"\n  Top-{top_k} videos by per-video Ano-AUC:")
+        print(f"  {'Rank':<5} {'Class':<15} {'File':<35} {'AUC':>7} {'F1':>7} "
+              f"{'Acc':>7} {'Segs':>5} {'Anom':>5}")
+        print("  " + "-" * 95)
+        for rank, v in enumerate(show, 1):
+            class_name = os.path.basename(os.path.dirname(v['npy_path']))
+            file_stem = os.path.splitext(os.path.basename(v['npy_path']))[0]
+            auc_s = f"{v['auc']:.4f}" if not np.isnan(v['auc']) else "N/A"
+            print(f"  {rank:<5} {class_name:<15} {file_stem:<35} "
+                  f"{auc_s:>7} {v['segment_f1']:>7.4f} "
+                  f"{v['segment_acc']:>7.4f} {v['n_segments']:>5} {v['n_anomaly']:>5}")
+        print("  " + "-" * 95)
+
+    print("\n" + "=" * 70)
+
+
+def select_top_segment_f1_files(
+    file_scores: Dict[str, Dict],
+    top_n: int = 5,
+) -> List[str]:
+    """
+    Select top N files by segment-level F1 score.
+
+    Only considers files that contain anomaly segments (file_label == 1),
+    since F1 is 0.0 for purely normal files by definition.
+
+    Args:
+        file_scores: Dictionary from aggregate_by_file().
+        top_n: Number of top files to select.
+
+    Returns:
+        List of selected npy_paths sorted by segment F1 (descending).
+    """
+    # Filter to files with anomaly ground truth (F1 is meaningful)
+    anomaly_files = [
+        (path, data) for path, data in file_scores.items()
+        if data['file_label'] == 1
+    ]
+
+    # Sort by segment F1 descending
+    anomaly_files.sort(key=lambda x: x[1]['segment_f1'], reverse=True)
+
+    selected = anomaly_files[:top_n]
+
+    print(f"\nTop-{top_n} files by segment-level F1 score:")
+    print(f"{'Rank':<5} {'Class':<15} {'File':<35} {'F1':>7} {'Prec':>7} "
+          f"{'Rec':>7} {'Acc':>7} {'Segs':>5} {'Anom':>5}")
+    print("-" * 100)
+    for rank, (npy_path, data) in enumerate(selected, 1):
+        class_name = os.path.basename(os.path.dirname(npy_path))
+        file_stem = os.path.splitext(os.path.basename(npy_path))[0]
+        print(f"{rank:<5} {class_name:<15} {file_stem:<35} "
+              f"{data['segment_f1']:>7.4f} {data['segment_precision']:>7.4f} "
+              f"{data['segment_recall']:>7.4f} {data['segment_acc']:>7.4f} "
+              f"{data['num_segments']:>5} {data['num_anomaly_segments']:>5}")
+    print("-" * 100)
+
+    return [path for path, _ in selected]
+
+
 def evaluate(
     checkpoint_path: str,
     feature_dir: str,
@@ -620,6 +1041,8 @@ def evaluate(
     num_workers: int = 4,
     output_dir: str = "./evaluation",
     plot_files: int = 10,
+    top_f1_files: int = 0,
+    top_ano_auc_files: int = 0,
     seed: int = 42,
 ):
     """Main evaluation function."""
@@ -629,7 +1052,7 @@ def evaluate(
 
     # Load dataset (test split)
     print("\nLoading test dataset...")
-    dataset = ETRIFeatureDataset(
+    dataset = NPYFeatureDataset(
         feature_dir=feature_dir,
         annotation_dir=annotation_dir,
         unit_duration=unit_duration,
@@ -666,6 +1089,11 @@ def evaluate(
     load_checkpoint(checkpoint_path, model=model, device=device)
     model = model.to(device)
 
+    save_suffix = dataset_name + "_" + model_type
+    # output_dir = os.path.join(output_dir, save_suffix)
+    output_dir = "./evaluation_" + save_suffix
+    os.makedirs(output_dir, exist_ok=True)
+
     # Evaluate
     print("\nRunning evaluation...")
     results = evaluate_model(model, data_loader, device, model_type=model_type)
@@ -698,12 +1126,21 @@ def evaluate(
     file_scores = aggregate_by_file(
         dataset, results['probs'], results['labels'],
         results['logits_normal'], results['logits_anomaly'],
-    )    
-    
-    save_suffix = dataset_name + "_" + model_type
-    # output_dir = os.path.join(output_dir, save_suffix)
-    output_dir = "./evaluation_" + save_suffix
-    os.makedirs(output_dir, exist_ok=True)
+    )
+
+    # Video-level evaluation
+    video_metrics = compute_video_level_metrics(file_scores, agg_method="mean") # mean or max
+    print_video_level_report(video_metrics)
+
+    # Anomaly-only AUC (segment-level + video-level)
+    ano_metrics = compute_anomaly_only_auc(file_scores)
+    print_anomaly_only_report(ano_metrics, top_k=top_ano_auc_files)
+
+    # Plot video-level ROC curve
+    plot_video_level_roc(
+        video_metrics,
+        os.path.join(output_dir, "video_level_roc_curve.png"),
+    )
 
     if plot_files > 0:
         # Select files ensuring at least 1 per class
@@ -716,23 +1153,53 @@ def evaluate(
                 os.path.join(output_dir, "timeline_plots"),
             )
 
+    # Top Ano-AUC timeline plots
+    if top_ano_auc_files > 0:
+        ranked = sorted(
+            ano_metrics['per_video_auc'],
+            key=lambda v: v['auc'] if not np.isnan(v['auc']) else -1,
+            reverse=True,
+        )
+        top_auc_paths = [v['npy_path'] for v in ranked[:top_ano_auc_files]]
+        print(f"\nPlotting timeline for top-{top_ano_auc_files} Ano-AUC files...")
+        for npy_path in top_auc_paths:
+            plot_file_timeline(
+                file_scores, npy_path,
+                os.path.join(output_dir, "timeline_top_ano_auc"),
+            )
+
+    # Top segment-level F1 files
+    if top_f1_files > 0:
+        top_f1_paths = select_top_segment_f1_files(file_scores, top_n=top_f1_files)
+        print(f"\nPlotting timeline for top-{top_f1_files} segment F1 files...")
+        for npy_path in top_f1_paths:
+            plot_file_timeline(
+                file_scores, npy_path,
+                os.path.join(output_dir, "timeline_top_f1"),
+            )
+
     # Save results
     np.savez(
         os.path.join(output_dir, "results.npz"),
+        # Segment-level
         labels=results['labels'],
         probs=results['probs'],
         logits_normal=results['logits_normal'],
         logits_anomaly=results['logits_anomaly'],
         preds=results['preds'],
+        # Video-level
+        video_labels=video_metrics['video_labels'],
+        video_probs=video_metrics['video_probs'],
+        video_preds=video_metrics['video_preds'],
     )
     print(f"\nResults saved to {output_dir}")
 
-    return metrics, file_scores
+    return metrics, file_scores, video_metrics
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate FeatureSpottingModel on pre-extracted npy features (ETRI)"
+        description="Evaluate FeatureSpottingModel on pre-extracted npy features "
     )
 
     # Data
@@ -746,7 +1213,7 @@ def parse_args():
     # Model
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint")
-    parser.add_argument("--model-type", type=str, default="linear",
+    parser.add_argument("--model-type", type=str, required=True,
                         choices=["linear", "resmlp"],
                         help="Model type: linear (FeatureSpottingModel) or resmlp (ResidualMLPSpottingModel)")
     parser.add_argument("--embed-dim", type=int, default=512,
@@ -772,8 +1239,11 @@ def parse_args():
     #                     help="Directory to save outputs")
     parser.add_argument("--plot-files", type=int, default=3,
                         help="Number of files to plot timelines for")
+    parser.add_argument("--top-f1-files", type=int, default=5,
+                        help="Number of top segment-level F1 files to plot timelines for")
+    parser.add_argument("--top-ano-auc-files", type=int, default=5,
+                        help="Number of top per-video Ano-AUC files to show and plot timelines for")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    
 
     return parser.parse_args()
 
@@ -809,6 +1279,8 @@ def main():
         num_workers=args.num_workers,
 #        output_dir=args.output_dir,
         plot_files=args.plot_files,
+        top_f1_files=args.top_f1_files,
+        top_ano_auc_files=args.top_ano_auc_files,
         seed=args.seed,
     )
 
