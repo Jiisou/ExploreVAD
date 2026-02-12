@@ -284,92 +284,68 @@ class RealtimeVideoInference:
         return frames
 
 
-def draw_styled_text(img, text, pos, font_scale, color, thickness=2, bg_opacity=0.6):
-    """Draw text with semi-transparent background."""
+# --- Padding layout ---
+# All UI is drawn in padding areas; original video frame is never touched.
+HEADER_H = 28   # top bar: prediction label + latency
+FOOTER_H = 22   # bottom bar: timeline
+
+
+def create_padded_frame(frame: np.ndarray) -> np.ndarray:
+    """Add dark header/footer padding around the original frame."""
+    h, w = frame.shape[:2]
+    padded = np.zeros((HEADER_H + h + FOOTER_H, w, 3), dtype=np.uint8)
+    padded[:HEADER_H, :] = C_DARK
+    padded[HEADER_H + h:, :] = C_DARK
+    padded[HEADER_H:HEADER_H + h, :] = frame
+    return padded
+
+
+def draw_header(padded, label, prob, color, latency):
+    """Draw prediction + latency inside the header padding."""
+    w = padded.shape[1]
     font = cv2.FONT_HERSHEY_SIMPLEX
-    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-    x, y = pos
 
-    overlay = img.copy()
-    cv2.rectangle(overlay, (x - 10, y - th - 10), (x + tw + 10, y + baseline + 10), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, bg_opacity, img, 1 - bg_opacity, 0, img)
-    cv2.putText(img, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+    # Color accent line at bottom edge of header
+    cv2.rectangle(padded, (0, HEADER_H - 3), (w, HEADER_H), color, -1)
 
+    # Prediction (left)
+    cv2.putText(padded, f"{label} ({prob:.1%})", (6, 19),
+                font, 0.42, color, 1, cv2.LINE_AA)
 
-def draw_frame_overlay(frame, label, prob, color):
-    """Draw prediction overlay on frame."""
-    h, w = frame.shape[:2]
-
-    # Border for abnormal detection
-    if label == "ABNORMAL":
-        cv2.rectangle(frame, (0, 0), (w-1, h-1), color, 12)
-    else:
-        cv2.rectangle(frame, (0, 0), (w-1, h-1), color, 4)
-
-    # Prediction info (top-left)
-    pred_str = f"PRED: {label} ({prob:.1%})"
-    draw_styled_text(frame, pred_str, (20, 40), 0.5, color, 2)
-
-    return frame
+    # Latency (right)
+    lat = f"latency: {latency:.2f}s"
+    (tw, _), _ = cv2.getTextSize(lat, font, 0.38, 1)
+    cv2.putText(padded, lat, (w - tw - 6, 19),
+                font, 0.38, (0, 230, 0), 1, cv2.LINE_AA)
 
 
-def draw_timeline_bar(frame, timeline_data, current_time, total_duration, triggers):
-    """Draw timeline bar at bottom of frame."""
-    h, w = frame.shape[:2]
-    bar_h = 50
-    margin = 40
-    tl_w = w - (margin * 2)
-    tl_x, tl_y = margin, h - bar_h - 60
+def draw_footer_timeline(padded, timeline_data, current_time, total_duration, orig_h):
+    """Draw compact timeline bar inside the footer padding."""
+    w = padded.shape[1]
+    margin = 6
+    bar_h = 12
+    tl_w = w - margin * 2
+    tl_x = margin
+    tl_y = HEADER_H + orig_h + 4  # inside footer area
 
-    # Timeline background
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (tl_x - 5, tl_y - 5), (tl_x + tl_w + 5, tl_y + bar_h + 20), C_DARK, -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-
-    # Draw segments
+    # Segments
     if timeline_data and total_duration > 0:
+        seg_w = max(2, int(tl_w / max(1, total_duration)))
         for r in timeline_data:
             ratio = min(1.0, r['time'] / total_duration)
-            seg_x = int(tl_x + ratio * tl_w)
-            seg_w = max(3, int(tl_w / max(1, total_duration)))
-
+            sx = int(tl_x + ratio * tl_w)
             color = C_RED if r['pred'] == 1 else C_BLUE
-            cv2.rectangle(frame, (seg_x, tl_y + 10), (seg_x + seg_w, tl_y + bar_h), color, -1)
+            cv2.rectangle(padded, (sx, tl_y), (sx + seg_w, tl_y + bar_h), color, -1)
 
-    # Inference trigger markers
-    for trig_time in triggers:
-        if total_duration > 0:
-            ratio = min(1.0, trig_time / total_duration)
-            trig_x = int(tl_x + ratio * tl_w)
-            cv2.line(frame, (trig_x, tl_y), (trig_x, tl_y + 8), C_WHITE, 1)
-
-    # Playhead
+    # Playhead + time label
     if total_duration > 0:
         px = int(tl_x + (current_time / total_duration) * tl_w)
-        cv2.line(frame, (px, tl_y - 15), (px, tl_y + bar_h + 15), C_ACCENT, 3, cv2.LINE_AA)
+        cv2.line(padded, (px, tl_y - 2), (px, tl_y + bar_h + 2), C_ACCENT, 2, cv2.LINE_AA)
 
-        # Time display
-        time_str = f"{current_time:.1f}s / {total_duration:.1f}s"
-        cv2.putText(frame, time_str, (tl_x, tl_y + bar_h + 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, C_WHITE, 1, cv2.LINE_AA)
-
-    return frame
-
-
-def draw_latency_info(frame, latency):
-    """Draw latency info (top-right)."""
-    h, w = frame.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    lat_text = f"Latency: {latency:.2f}s"
-    (lw, lh), _ = cv2.getTextSize(lat_text, font, 0.5, 1)
-    lx = w - lw - 20
-    ly = 35
-
-    cv2.rectangle(frame, (lx - 5, ly - lh - 5), (lx + lw + 5, ly + 5), (0, 0, 0), -1)
-    cv2.putText(frame, lat_text, (lx, ly), font, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
-
-    return frame
+        time_str = f"{current_time:.1f}s/{total_duration:.0f}s"
+        (tw, _), _ = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1)
+        cv2.putText(padded, time_str, (w - tw - margin, tl_y + bar_h + 1),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, C_WHITE, 1, cv2.LINE_AA)
 
 
 def process_video_realtime(
@@ -401,22 +377,25 @@ def process_video_realtime(
     duration = total_frames / fps if fps > 0 else 0
 
     filename = os.path.basename(video_path)
+    out_w = w
+    out_h = h + HEADER_H + FOOTER_H
     print(f"\nProcessing: {filename}")
-    print(f"  Duration: {duration:.1f}s, FPS: {fps:.1f}, Resolution: {w}x{h}")
+    print(f"  Duration: {duration:.1f}s, FPS: {fps:.1f}, Video: {w}x{h}, Canvas: {out_w}x{out_h}")
 
     # Reset inference engine
     inference_engine.reset()
 
-    # Video writer
+    # Video writer (padded size)
     out = None
     if output_path:
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+        out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (out_w, out_h))
 
-    # Preview window
+    # Preview window - scale up for small videos
     if show_preview:
         cv2.namedWindow('Anomaly Detection - Realtime', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Anomaly Detection - Realtime', min(1280, w), min(720, h))
+        scale = max(1, min(3, 720 // out_h))
+        cv2.resizeWindow('Anomaly Detection - Realtime', out_w * scale, out_h * scale)
 
     wait_ms = max(1, int(1000 / fps / playback_speed))
     last_inference_time = -inference_engine.stride_time
@@ -451,22 +430,22 @@ def process_video_realtime(
                 )
                 thread.start()
 
-        # Draw overlays
-        display_frame = frame.copy()
-        display_frame = draw_frame_overlay(
+        # Build display: header + original frame + footer (no overlay on video)
+        display_frame = create_padded_frame(frame)
+        draw_header(
             display_frame,
             inference_engine.latest_label,
             inference_engine.latest_prob,
             inference_engine.latest_color,
+            inference_engine.last_latency,
         )
-        display_frame = draw_timeline_bar(
+        draw_footer_timeline(
             display_frame,
             inference_engine.timeline_data,
             current_time,
             duration,
-            inference_engine.inference_triggers,
+            h,
         )
-        display_frame = draw_latency_info(display_frame, inference_engine.last_latency)
 
         # Write output
         if out:
@@ -481,7 +460,6 @@ def process_video_realtime(
             elif key == ord('n'):
                 break
             elif key == ord(' '):
-                # Pause
                 cv2.waitKey(0)
 
     cap.release()
