@@ -120,8 +120,12 @@ class MobileCLIPExtractor:
 
         print(f"MobileCLIP loaded on {self.device}")
 
+        # CUDA Events for Timing
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
+
     @torch.no_grad()
-    def extract_features(self, frames: List[Image.Image]) -> np.ndarray:
+    def extract_features(self, frames: List[Image.Image]) -> Tuple[np.ndarray, float]:
         """
         Extract features from frames and return averaged feature vector.
 
@@ -130,18 +134,30 @@ class MobileCLIPExtractor:
 
         Returns:
             Feature vector of shape (1, D).
+            gpu inference latency (ms)
         """
         if not frames:
             return None
 
         batch_images = torch.stack([self.preprocess(frame) for frame in frames]).to(self.device)
+        # # CPU -> GPU Upload (데이터 이동은 E2E에 포함, GPU 연산 측정 시작 전 준비)
+        # batch_np = np.stack(frames)
+        # batch_tensor = torch.from_numpy(batch_np).permute(0, 3, 1, 2).to(self.device, non_blocking=True).float()
+
+        self.start_event.record() # GPU 연산 시간 측정 시작
 
         with torch.cuda.amp.autocast():
             image_features = self.model.encode_image(batch_images)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         # Temporal mean pooling
-        return image_features.mean(dim=0, keepdim=True).cpu().numpy()
+        pooled = image_features.mean(dim=0, keepdim=True).cpu().numpy()
+
+        self.end_event.record() # GPU 연산 시간 측정 종료
+        torch.cuda.synchronize() # GPU 연산이 끝날 때까지 대기
+        gpu_latency = self.start_event.elapsed_time(self.end_event) # GPU 연산 시간 측정
+
+        return pooled, gpu_latency
 
 
 class RealtimeVideoInference:
@@ -176,9 +192,12 @@ class RealtimeVideoInference:
         self.timeline_data = []
         self.inference_triggers = []
 
-        # [KEY CHANGE] Buffer stores numpy arrays (BGR), not PIL Images
+        # Buffer stores numpy arrays (BGR), not PIL Images
         self.buffer_maxlen = int(30 * 2) # fps * window_time
         self.frame_buffer = deque(maxlen=self.buffer_maxlen)
+
+        self.latency_e2e = 0.0
+        self.latency_gpu = 0.0 # GPU 피처 추출 연산 시간
 
     def reset(self):
         """Reset state for new video."""
@@ -208,20 +227,23 @@ class RealtimeVideoInference:
     @torch.no_grad()
     def run_inference(
         self,
-        raw_frames: List[np.ndarray], # 입력 타입 변경: Image -> np.ndarray
+        raw_frames: List[np.ndarray], # 입력 타입: Image -> np.ndarray
         current_time: float,
     ):
-        start_t = time.time()
+        start_t = time.time() # E2E 소요시간 측정 시작
         
         try:
             # [최적화] 추론 스레드 내부에서, 실제로 필요한 8장만 변환 수행
             pil_frames = []
+            if raw_frames is None:
+                print("raw_frames is None")
+                exit()
             for frame in raw_frames:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_frames.append(Image.fromarray(frame_rgb))
 
             # Extract features
-            features = self.extractor.extract_features(pil_frames)            
+            features, gpu_ms = self.extractor.extract_features(pil_frames)      
             if features is None:
                 self.is_processing = False
                 return
@@ -230,7 +252,6 @@ class RealtimeVideoInference:
             # features shape: (1, D) -> need (1, T, D) for model
             # Since we already did temporal pooling, we expand to (1, 1, D)
             features_tensor = torch.from_numpy(features).float().unsqueeze(0).to(self.device)
-
             self.classifier.eval()
             logit = self.classifier(features_tensor).squeeze()
 
@@ -248,6 +269,10 @@ class RealtimeVideoInference:
             self.latest_prob = prob
             self.last_latency = time.time() - start_t
 
+            end_t = time.time()
+            self.latency_e2e = end_t - start_t
+            self.latency_gpu = gpu_ms
+
             # Store result
             self.timeline_data.append({
                 'time': current_time,
@@ -256,7 +281,7 @@ class RealtimeVideoInference:
                 'pred': pred,
             })
 
-            print(f"  -> [{current_time:.1f}s] {self.latest_label} (prob={prob:.3f}, latency={self.last_latency:.2f}s)")
+            print(f"  -> [{current_time:.1f}s] {self.latest_label} (prob={prob:.3f}, Total latency={self.last_latency:.2f}s, GPU latency={self.latency_gpu:.1f}ms)")
 
         except Exception as e:
             print(f"Inference error: {e}")
@@ -318,8 +343,8 @@ def create_padded_frame(frame: np.ndarray) -> np.ndarray:
     return padded
 
 
-def draw_header(padded, label, prob, color, latency):
-    """Draw prediction + latency inside the header padding."""
+def draw_header(padded, label, prob, color, latency_e2e, latency_gpu):
+    """Draw prediction + latency infos inside the header padding."""
     w = padded.shape[1]
     font = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -331,10 +356,11 @@ def draw_header(padded, label, prob, color, latency):
                 font, 0.42, color, 1, cv2.LINE_AA)
 
     # Latency (right)
-    lat = f"latency: {latency:.2f}s"
-    (tw, _), _ = cv2.getTextSize(lat, font, 0.38, 1)
-    cv2.putText(padded, lat, (w - tw - 6, 19),
-                font, 0.38, (0, 230, 0), 1, cv2.LINE_AA)
+    lat_text = f"GPU: {latency_gpu:.1f}ms | Total: {latency_e2e:.2f}s"
+    
+    (tw, _), _ = cv2.getTextSize(lat_text, font, 0.35, 1)
+    cv2.putText(padded, lat_text, (w - tw - 4, 19), 
+                font, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
 
 
 def draw_footer_timeline(padded, timeline_data, current_time, total_duration, orig_h):
@@ -457,7 +483,8 @@ def process_video_realtime(
             inference_engine.latest_label,
             inference_engine.latest_prob,
             inference_engine.latest_color,
-            inference_engine.last_latency,
+            inference_engine.latency_e2e,
+            inference_engine.latency_gpu,
         )
         draw_footer_timeline(
             display_frame,
