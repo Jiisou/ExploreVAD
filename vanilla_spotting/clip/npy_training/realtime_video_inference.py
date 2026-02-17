@@ -176,6 +176,10 @@ class RealtimeVideoInference:
         self.timeline_data = []
         self.inference_triggers = []
 
+        # [KEY CHANGE] Buffer stores numpy arrays (BGR), not PIL Images
+        self.buffer_maxlen = int(30 * 2) # fps * window_time
+        self.frame_buffer = deque(maxlen=self.buffer_maxlen)
+
     def reset(self):
         """Reset state for new video."""
         self.latest_label = "SCANNING"
@@ -185,25 +189,39 @@ class RealtimeVideoInference:
         self.last_latency = 0.0
         self.timeline_data = []
         self.inference_triggers = []
+        self.frame_buffer.clear()
+
+    def update_buffer(self, frame: np.ndarray):
+        """Store raw numpy frame. Very fast."""
+        self.frame_buffer.append(frame)
+
+    def _get_sampled_frames(self) -> List[np.ndarray]:
+        """Sample raw frames from buffer."""
+        curr_len = len(self.frame_buffer)
+        if curr_len == 0:
+            return []
+        
+        # Linear sampling with replication if needed
+        indices = np.linspace(0, curr_len - 1, self.num_frames, dtype=int)
+        return [self.frame_buffer[i] for i in indices]
 
     @torch.no_grad()
     def run_inference(
         self,
-        frames: List[Image.Image],
+        raw_frames: List[np.ndarray], # 입력 타입 변경: Image -> np.ndarray
         current_time: float,
     ):
-        """
-        Run inference on a window of frames.
-
-        Args:
-            frames: List of PIL Images for the window.
-            current_time: Current video time in seconds.
-        """
         start_t = time.time()
-
+        
         try:
+            # [최적화] 추론 스레드 내부에서, 실제로 필요한 8장만 변환 수행
+            pil_frames = []
+            for frame in raw_frames:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_frames.append(Image.fromarray(frame_rgb))
+
             # Extract features
-            features = self.extractor.extract_features(frames)
+            features = self.extractor.extract_features(pil_frames)            
             if features is None:
                 self.is_processing = False
                 return
@@ -382,7 +400,10 @@ def process_video_realtime(
     print(f"\nProcessing: {filename}")
     print(f"  Duration: {duration:.1f}s, FPS: {fps:.1f}, Video: {w}x{h}, Canvas: {out_w}x{out_h}")
 
-    # Reset inference engine
+    # Reset engine and sync FPS
+    inference_engine.fps = fps
+    inference_engine.buffer_maxlen = int(fps * inference_engine.window_time)
+    inference_engine.frame_buffer = deque(maxlen=inference_engine.buffer_maxlen)
     inference_engine.reset()
 
     # Video writer (padded size)
@@ -403,8 +424,9 @@ def process_video_realtime(
 
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
+
+        inference_engine.update_buffer(frame)
 
         current_time = frame_idx / fps
         frame_idx += 1
@@ -412,23 +434,21 @@ def process_video_realtime(
         # Trigger inference at stride intervals
         if current_time - last_inference_time >= inference_engine.stride_time:
             if not inference_engine.is_processing:
-                inference_engine.is_processing = True
-                last_inference_time = current_time
-                inference_engine.inference_triggers.append(current_time)
+                # 버퍼에 데이터가 있는지 확인
+                if len(inference_engine.frame_buffer) > 0:
+                    inference_engine.is_processing = True
+                    last_inference_time = current_time
+                    
+                    # 샘플링 (여기서는 Numpy Array 리스트가 반환됨)
+                    sampled_raw_frames = inference_engine._get_sampled_frames()
 
-                # Sample frames for this window
-                frames = inference_engine._sample_frames_from_video(cap, current_time, fps, duration)
-
-                # Restore position after sampling
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-
-                # Run inference in thread
-                thread = threading.Thread(
-                    target=inference_engine.run_inference,
-                    args=(frames, current_time),
-                    daemon=True
-                )
-                thread.start()
+                    # 스레드 시작
+                    thread = threading.Thread(
+                        target=inference_engine.run_inference,
+                        args=(sampled_raw_frames, current_time),
+                        daemon=True
+                    )
+                    thread.start()
 
         # Build display: header + original frame + footer (no overlay on video)
         display_frame = create_padded_frame(frame)
