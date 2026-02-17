@@ -120,34 +120,54 @@ class MobileCLIPExtractor:
 
         print(f"MobileCLIP loaded on {self.device}")
 
+        # CLIP Default Mean/Std
+        self.mean = torch.tensor([0, 0, 0], device=self.device).view(1, 3, 1, 1)
+        self.std = torch.tensor([1, 1, 1], device=self.device).view(1, 3, 1, 1)
+
         # CUDA Events for Timing
         self.start_event = torch.cuda.Event(enable_timing=True)
         self.end_event = torch.cuda.Event(enable_timing=True)
 
     @torch.no_grad()
-    def extract_features(self, frames: List[Image.Image]) -> Tuple[np.ndarray, float]:
+    def extract_features(self, raw_frames: List[np.ndarray]) -> Tuple[np.ndarray, float]:
         """
         Extract features from frames and return averaged feature vector.
 
         Args:
-            frames: List of PIL Images.
+            raw_frames: List of np.ndarray.
 
         Returns:
             Feature vector of shape (1, D).
             gpu inference latency (ms)
         """
-        if not frames:
+        if not raw_frames:
             return None
 
-        batch_images = torch.stack([self.preprocess(frame) for frame in frames]).to(self.device)
-        # # CPU -> GPU Upload (데이터 이동은 E2E에 포함, GPU 연산 측정 시작 전 준비)
-        # batch_np = np.stack(frames)
-        # batch_tensor = torch.from_numpy(batch_np).permute(0, 3, 1, 2).to(self.device, non_blocking=True).float()
+        # 1. Batchify: List[np.array] -> Single Numpy Buffer -> Tensor
+        # np.stack은 빠릅니다. (8, H, W, C)
+        batch_np = np.stack(raw_frames)
+        
+        # 2. To Tensor & GPU Move (Async)
+        # Permute: (B, H, W, C) -> (B, C, H, W)
+        batch_tensor = torch.from_numpy(batch_np).permute(0, 3, 1, 2).to(self.device, non_blocking=True).float()
 
         self.start_event.record() # GPU 연산 시간 측정 시작
 
+        # 3. BGR to RGB (GPU에서 수행) & 0~1 Scaling
+        # OpenCV는 BGR이므로 순서를 바꿔줍니다. indices: [2, 1, 0]
+        batch_tensor = batch_tensor[:, [2, 1, 0], :, :] / 255.0
+
+        # 4. Resize & CenterCrop (GPU Operation)
+        # MobileCLIP 입력 해상도인 224x224로 맞춥니다.
+        # interpolate는 GPU 가속을 받습니다.
+        batch_tensor = torch.nn.functional.interpolate(batch_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+        
+        # 5. Normalize (GPU Operation)
+        batch_tensor = (batch_tensor - self.mean) / self.std
+
+        # 6. Inference
         with torch.cuda.amp.autocast():
-            image_features = self.model.encode_image(batch_images)
+            image_features = self.model.encode_image(batch_tensor)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         # Temporal mean pooling
