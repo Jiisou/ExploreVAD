@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import os
+import csv
 import threading
 import time
 from collections import deque
@@ -68,6 +69,7 @@ C_RED = (90, 90, 255)
 C_WHITE = (245, 245, 245)
 C_DARK = (30, 30, 30)
 C_ACCENT = (0, 215, 255)
+C_GREEN = (90, 220, 120)
 
 
 class MobileCLIPExtractor:
@@ -192,6 +194,7 @@ class RealtimeVideoInference:
         num_frames: int = 8,
         stride_time: float = 1.0,
         threshold: float = 0.5,
+        gt_annotation: Optional[Dict[int, int]] = None,
     ):
         self.extractor = feature_extractor
         self.classifier = classifier
@@ -200,6 +203,7 @@ class RealtimeVideoInference:
         self.num_frames = num_frames
         self.stride_time = stride_time
         self.threshold = threshold
+        self.gt_annotation = gt_annotation or {}
 
         # State
         self.latest_label = "SCANNING"
@@ -299,6 +303,7 @@ class RealtimeVideoInference:
                 'label': self.latest_label,
                 'prob': prob,
                 'pred': pred,
+                'gt': self.get_gt_label(current_time),
             })
 
             print(f"  -> [{current_time:.1f}s] {self.latest_label} (prob={prob:.3f}, Total latency={self.last_latency:.2f}s, GPU latency={self.latency_gpu:.1f}ms)")
@@ -310,6 +315,13 @@ class RealtimeVideoInference:
 
         finally:
             self.is_processing = False
+
+    def get_gt_label(self, current_time: float) -> Optional[int]:
+        """Return GT label for current second. 1=abnormal, 0=normal."""
+        if not self.gt_annotation:
+            return None
+        sec = int(current_time)
+        return self.gt_annotation.get(sec)
 
     def _sample_frames_from_video(
         self,
@@ -350,7 +362,8 @@ class RealtimeVideoInference:
 # --- Padding layout ---
 # All UI is drawn in padding areas; original video frame is never touched.
 HEADER_H = 28   # top bar: prediction label + latency
-FOOTER_H = 22   # bottom bar: timeline
+FOOTER_H = 48   # bottom bar:   timeline + GT compare
+
 
 
 def create_padded_frame(frame: np.ndarray) -> np.ndarray:
@@ -384,13 +397,17 @@ def draw_header(padded, label, prob, color, latency_e2e, latency_gpu):
 
 
 def draw_footer_timeline(padded, timeline_data, current_time, total_duration, orig_h):
-    """Draw compact timeline bar inside the footer padding."""
+    """Draw compact timeline bars (prediction + optional GT) inside footer."""
     w = padded.shape[1]
     margin = 6
-    bar_h = 12
+    bar_h = 10
     tl_w = w - margin * 2
     tl_x = margin
-    tl_y = HEADER_H + orig_h + 4  # inside footer area
+    # tl_y = HEADER_H + orig_h + 4  # inside footer area
+    pred_y = HEADER_H + orig_h + 4
+    gt_y = pred_y + bar_h + 6
+
+    has_gt = any(r.get('gt') is not None for r in timeline_data)
 
     # Segments
     if timeline_data and total_duration > 0:
@@ -399,17 +416,198 @@ def draw_footer_timeline(padded, timeline_data, current_time, total_duration, or
             ratio = min(1.0, r['time'] / total_duration)
             sx = int(tl_x + ratio * tl_w)
             color = C_RED if r['pred'] == 1 else C_BLUE
-            cv2.rectangle(padded, (sx, tl_y), (sx + seg_w, tl_y + bar_h), color, -1)
+            # cv2.rectangle(padded, (sx, tl_y), (sx + seg_w, tl_y + bar_h), color, -1)
+            cv2.rectangle(padded, (sx, pred_y), (sx + seg_w, pred_y + bar_h), color, -1)
+
+            if has_gt and r.get('gt') is not None:
+                gt_color = C_RED if r['gt'] == 1 else C_GREEN
+                cv2.rectangle(padded, (sx, gt_y), (sx + seg_w, gt_y + bar_h), gt_color, -1)
 
     # Playhead + time label
     if total_duration > 0:
         px = int(tl_x + (current_time / total_duration) * tl_w)
-        cv2.line(padded, (px, tl_y - 2), (px, tl_y + bar_h + 2), C_ACCENT, 2, cv2.LINE_AA)
+        # cv2.line(padded, (px, tl_y - 2), (px, tl_y + bar_h + 2), C_ACCENT, 2, cv2.LINE_AA)
+        bottom = gt_y + bar_h + 2 if has_gt else pred_y + bar_h + 2
+        cv2.line(padded, (px, pred_y - 2), (px, bottom), C_ACCENT, 2, cv2.LINE_AA)
+
 
         time_str = f"{current_time:.1f}s/{total_duration:.0f}s"
         (tw, _), _ = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX, 0.3, 1)
-        cv2.putText(padded, time_str, (w - tw - margin, tl_y + bar_h + 1),
+        # cv2.putText(padded, time_str, (w - tw - margin, tl_y + bar_h + 1),
+        #             cv2.FONT_HERSHEY_SIMPLEX, 0.3, C_WHITE, 1, cv2.LINE_AA)
+        cv2.putText(padded, time_str, (w - tw - margin, gt_y + bar_h + 1),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.3, C_WHITE, 1, cv2.LINE_AA)
+
+
+    cv2.putText(padded, "Pred", (tl_x, pred_y - 1),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.3, C_WHITE, 1, cv2.LINE_AA)
+    if has_gt:
+        cv2.putText(padded, "GT", (tl_x, gt_y - 1),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.3, C_WHITE, 1, cv2.LINE_AA)
+
+
+def parse_time_to_seconds(time_str: str) -> int:
+    """Parse HH:MM:SS into seconds."""
+    parts = [p.strip() for p in time_str.strip().split(':')]
+    if len(parts) != 3:
+        raise ValueError(f"Invalid time format: {time_str}")
+    hh, mm, ss = map(int, parts)
+    return hh * 3600 + mm * 60 + ss
+
+
+def parse_label_to_binary(label_value: str) -> int:
+    """Convert label string to binary (1 abnormal / 0 normal)."""
+    v = str(label_value).strip().lower()
+    abnormal_tokens = {"1", "abnormal", "anomaly", "true", "yes", "y"}
+    return 1 if v in abnormal_tokens else 0
+
+
+def load_gt_annotation(csv_path: str) -> Dict[int, int]:
+    """Load per-second GT annotation from CSV.
+
+    CSV should include a time column (HH:MM:SS) and a label column.
+    Supported column names (case-insensitive):
+      - time: time, timestamp, ts
+      - label: label, abnormal, gt, is_abnormal
+    """
+    annotation = {}
+    with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError(f"CSV has no header: {csv_path}")
+
+        field_map = {name.lower().strip(): name for name in reader.fieldnames}
+        time_col = next((field_map[k] for k in ["time", "timestamp", "ts"] if k in field_map), None)
+        label_col = next((field_map[k] for k in ["label", "abnormal", "gt", "is_abnormal"] if k in field_map), None)
+
+        if time_col is None or label_col is None:
+            raise ValueError(
+                f"CSV must contain time+label columns. Got columns: {reader.fieldnames}"
+            )
+
+        for row in reader:
+            if not row.get(time_col):
+                continue
+            sec = parse_time_to_seconds(row[time_col])
+            annotation[sec] = parse_label_to_binary(row.get(label_col, "0"))
+
+    return annotation
+
+
+def load_gt_from_timestamps_csv(
+    csv_path: str,
+    video_filename: str,
+    is_normal_class: bool = False,
+    video_duration_sec: int = 0,
+) -> Dict[int, int]:
+    """Load GT annotation from {Class}_timestamps.csv for a specific video.
+
+    Expected CSV columns: file_name, start_time (H:MM:SS), end_time (H:MM:SS)
+    Returns per-second Dict[int, int] where 1=abnormal, 0=normal.
+
+    For normal class all seconds are labeled 0. For anomaly classes, seconds
+    inside any [start_time, end_time] interval are labeled 1, others 0.
+    """
+    annotation: Dict[int, int] = {}
+
+    # Normal class: all seconds are normal
+    if is_normal_class:
+        for sec in range(video_duration_sec):
+            annotation[sec] = 0
+        return annotation
+
+    if not csv_path or not os.path.exists(csv_path):
+        return annotation
+
+    video_stem = os.path.splitext(video_filename)[0]  # filename without ext
+
+    anomaly_segments: List[Tuple[int, int]] = []
+    with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return annotation
+
+        field_map = {name.lower().strip(): name for name in reader.fieldnames}
+        file_col  = next((field_map[k] for k in ['file_name', 'filename', 'file'] if k in field_map), None)
+        start_col = next((field_map[k] for k in ['start_time', 'start'] if k in field_map), None)
+        end_col   = next((field_map[k] for k in ['end_time', 'end'] if k in field_map), None)
+
+        if file_col is None or start_col is None or end_col is None:
+            raise ValueError(
+                f"CSV must have file_name/start_time/end_time columns. Got: {reader.fieldnames}"
+            )
+
+        for row in reader:
+            fname = row.get(file_col, '').strip()
+            fname_stem = os.path.splitext(fname)[0]
+            if fname == video_filename or fname_stem == video_stem:
+                try:
+                    s = parse_time_to_seconds(row[start_col])
+                    e = parse_time_to_seconds(row[end_col])
+                    anomaly_segments.append((s, e))
+                except (ValueError, KeyError):
+                    continue
+
+    # Build per-second annotation up to video duration
+    for sec in range(video_duration_sec):
+        label = 0
+        for s, e in anomaly_segments:
+            if s <= sec <= e:
+                label = 1
+                break
+        annotation[sec] = label
+
+    return annotation
+
+
+def compute_gt_metrics(timeline_data: List[Dict]) -> Optional[Dict[str, float]]:
+    """Compute simple comparison metrics for windows with GT available."""
+    rows = [r for r in timeline_data if r.get('gt') is not None]
+    if not rows:
+        return None
+
+    tp = sum(1 for r in rows if r['pred'] == 1 and r['gt'] == 1)
+    tn = sum(1 for r in rows if r['pred'] == 0 and r['gt'] == 0)
+    fp = sum(1 for r in rows if r['pred'] == 1 and r['gt'] == 0)
+    fn = sum(1 for r in rows if r['pred'] == 0 and r['gt'] == 1)
+    acc = (tp + tn) / len(rows)
+
+    return {
+        'count': len(rows),
+        'tp': tp,
+        'tn': tn,
+        'fp': fp,
+        'fn': fn,
+        'acc': acc,
+    }
+
+
+def resolve_gt_csv_path(gt_dir: str, video_path: str) -> Tuple[str, str]:
+    """Resolve GT CSV path using class-level naming convention.
+
+    Primary format: {video_class}_timestamps.csv
+    video_class is inferred from the parent directory name.
+    """
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    video_class = os.path.basename(os.path.dirname(video_path))
+
+    candidates = []
+    if video_class:
+        candidates.append((video_class, os.path.join(gt_dir, f"{video_class}_timestamps.csv")))
+
+    if "_" in video_name:
+        inferred = video_name.split("_", 1)[0]
+        if inferred != video_class:
+            candidates.append((inferred, os.path.join(gt_dir, f"{inferred}_timestamps.csv")))
+
+    # Backward-compatibility fallback for previous behavior
+    candidates.append((video_name, os.path.join(gt_dir, f"{video_name}.csv")))
+
+    for cls_name, csv_path in candidates:
+        if os.path.exists(csv_path):
+            return csv_path, cls_name
+
+    return "", video_class or video_name
 
 
 def process_video_realtime(
@@ -418,6 +616,7 @@ def process_video_realtime(
     output_path: Optional[str] = None,
     show_preview: bool = True,
     playback_speed: float = 1.0,
+    gt_timestamps_info: Optional[Dict] = None,
 ):
     """
     Process video with realtime inference visualization.
@@ -428,6 +627,8 @@ def process_video_realtime(
         output_path: Optional path to save output video.
         show_preview: Whether to show preview window.
         playback_speed: Playback speed multiplier.
+        gt_timestamps_info: Dict with keys csv_path, video_filename, is_normal.
+                            When provided, GT is loaded from {Class}_timestamps.csv.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -451,6 +652,28 @@ def process_video_realtime(
     inference_engine.buffer_maxlen = int(fps * inference_engine.window_time)
     inference_engine.frame_buffer = deque(maxlen=inference_engine.buffer_maxlen)
     inference_engine.reset()
+
+    # Load GT from timestamps CSV (requires duration to fill per-second labels)
+    if gt_timestamps_info:
+        csv_path   = gt_timestamps_info.get('csv_path', '')
+        vid_fname  = gt_timestamps_info.get('video_filename', filename)
+        is_normal  = gt_timestamps_info.get('is_normal', False)
+        class_name = gt_timestamps_info.get('class_name', '')
+        duration_sec = int(duration) + 1
+
+        if csv_path:
+            gt_anno = load_gt_from_timestamps_csv(csv_path, vid_fname, is_normal, duration_sec)
+            inference_engine.gt_annotation = gt_anno
+            abn_secs = sum(v for v in gt_anno.values())
+            print(f"  GT loaded: {abn_secs} abnormal / {len(gt_anno)} seconds "
+                  f"(class='{class_name}', csv={os.path.basename(csv_path)})")
+        elif is_normal:
+            # Normal class without CSV → fill all zeros
+            inference_engine.gt_annotation = {sec: 0 for sec in range(int(duration) + 1)}
+            print(f"  GT: Normal class, all seconds labeled 0")
+        else:
+            inference_engine.gt_annotation = {}
+            print(f"  GT: CSV not found for class '{class_name}', GT disabled")
 
     # Video writer (padded size)
     out = None
@@ -566,6 +789,14 @@ def print_video_summary(engine: RealtimeVideoInference, filename: str):
     print(f"Max anomaly prob: {max_prob:.4f}")
     print(f"Mean anomaly prob: {mean_prob:.4f}")
 
+    # gt_metrics = compute_gt_metrics(engine.timeline_data)
+    # if gt_metrics:
+    #     print("\nGT Comparison")
+    #     print(f"Compared windows: {gt_metrics['count']}")
+    #     print(f"TP={gt_metrics['tp']} TN={gt_metrics['tn']} FP={gt_metrics['fp']} FN={gt_metrics['fn']}")
+    #     print(f"Accuracy: {100 * gt_metrics['acc']:.2f}%")
+
+
     # Final verdict (consecutive abnormal or high ratio)
     consecutive = 0
     max_consecutive = 0
@@ -643,6 +874,10 @@ def parse_args():
                         help="Disable preview window")
     parser.add_argument("--speed", type=float, default=1.0,
                         help="Playback speed multiplier (default: 1.0)")
+    parser.add_argument("--gt-csv", type=str, default=None,
+                        help="GT annotation CSV for single video (time HH:MM:SS + abnormal label)")
+    parser.add_argument("--gt-dir", type=str, default=r"C:\JJS\UCF_Crimes\Annotations\unified",
+                        help="Directory of GT CSV files for --video-dir. Match by video basename.")
 
     return parser.parse_args()
 
@@ -685,7 +920,12 @@ def main():
     classifier = classifier.to(device)
     classifier.eval()
 
-    # Create inference engine
+    # Create inference engine    
+    gt_annotation = {}
+    if args.gt_csv:
+        gt_annotation = load_gt_annotation(args.gt_csv)
+        print(f"Loaded GT annotations: {len(gt_annotation)} seconds from {args.gt_csv}")
+
     inference_engine = RealtimeVideoInference(
         feature_extractor=extractor,
         classifier=classifier,
@@ -694,6 +934,7 @@ def main():
         num_frames=args.num_frames,
         stride_time=args.stride_time,
         threshold=args.threshold,
+        gt_annotation=gt_annotation,
     )
 
     # Get video files
@@ -705,6 +946,23 @@ def main():
 
     # Process videos
     for video_path in video_files:
+        gt_timestamps_info: Optional[Dict] = None
+
+        if args.gt_dir:
+            csv_path, class_name = resolve_gt_csv_path(args.gt_dir, video_path)
+            is_normal = class_name.lower() == "normal"
+            gt_timestamps_info = {
+                'csv_path': csv_path,
+                'video_filename': os.path.basename(video_path),
+                'is_normal': is_normal,
+                'class_name': class_name,
+            }
+            if not csv_path and not is_normal:
+                print(
+                    f"GT CSV not found for class '{class_name}'. "
+                    f"Expected: {os.path.join(args.gt_dir, f'{class_name}_timestamps.csv')}"
+                )
+
         output_path = None
         if args.output_dir:
             video_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -716,6 +974,7 @@ def main():
             output_path=output_path,
             show_preview=not args.no_preview,
             playback_speed=args.speed,
+            gt_timestamps_info=gt_timestamps_info,
         )
 
     print("\nAll videos processed!")
