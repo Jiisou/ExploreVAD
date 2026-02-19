@@ -329,7 +329,7 @@ def aggregate_by_file(
         if logits_anomaly is not None:
             file_scores[npy_path]['logits_anomaly'].append(logits_anomaly[idx])
         file_scores[npy_path]['labels'].append(label)
-        file_scores[npy_path]['timestamps'].append(sample['start_sec'])
+        file_scores[npy_path]['timestamps'].append(sample['start_idx'])
 
     for npy_path in file_scores:
         probs_arr = np.array(file_scores[npy_path]['probs'])
@@ -1029,7 +1029,7 @@ def select_top_segment_f1_files(
 def evaluate(
     checkpoint_path: str,
     feature_dir: str,
-    annotation_dir: str,
+    annotation_path: str,
     dataset_name: str,
     embed_dim: int = 512,
     unit_duration: int = 2,
@@ -1054,7 +1054,7 @@ def evaluate(
     print("\nLoading test dataset...")
     dataset = NPYFeatureDataset(
         feature_dir=feature_dir,
-        annotation_dir=annotation_dir,
+        annotation_path=annotation_path,
         unit_duration=unit_duration,
         overlap_ratio=overlap_ratio,
         strict_normal_sampling=False,  # Keep all windows for evaluation
@@ -1205,8 +1205,8 @@ def parse_args():
     # Data
     parser.add_argument("--feature-dir", type=str, required=True,
                         help="Path to test feature directory (e.g., .../MCi2-S0-6/test)")
-    parser.add_argument("--annotation-dir", type=str, required=True,
-                        help="Path to annotation directory with *_timestamp.csv files")
+    parser.add_argument("--annotation-path", type=str, required=True,
+                        help="Path to Text file or annotation directory with *_timestamp.csv files")
     parser.add_argument("--dataset-name", type=str, required=True,
                         help="Name of the dataset (ETRI or UCF) for identifying the source dataset")
 
@@ -1255,7 +1255,7 @@ def main():
     print("Feature-based Anomaly Action Spotting - Evaluation")
     print("=" * 60)
     print(f"Feature dir: {args.feature_dir}")
-    print(f"Annotation dir: {args.annotation_dir}")
+    print(f"Annotation path: {args.annotation_path}")
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Model type: {args.model_type}")
     print(f"Embed dim: {args.embed_dim}")
@@ -1267,7 +1267,7 @@ def main():
     evaluate(
         checkpoint_path=args.checkpoint,
         feature_dir=args.feature_dir,
-        annotation_dir=args.annotation_dir,
+        annotation_path=args.annotation_path,
         dataset_name=args.dataset_name,
         embed_dim=args.embed_dim,
         unit_duration=args.unit_duration,

@@ -483,9 +483,9 @@ class UCFCrimeSpottingDataset(Dataset):
         return compute_class_weights(labels, num_classes=2)
 
 
-class ETRIFeatureDataset(Dataset):
+class NPYFeatureDataset(Dataset):
     """
-    ETRI Feature Dataset for training on pre-extracted npy features.
+    Pre-extracted Feature Dataset for training on pre-extracted npy features.
 
     Each .npy file has shape (T_seconds, embed_dim) where row i is the
     feature vector at second i. Sliding windows of `unit_duration` seconds
@@ -508,22 +508,27 @@ class ETRIFeatureDataset(Dataset):
     def __init__(
         self,
         feature_dir: str,
-        annotation_dir: str,
+        annotation_path: str,
+        # txt_file_path="/mnt/c/Users/USER/Desktop/ExploreVAD/annotation/Temporal_Anomaly_Annotation_For_Testing_Videos/Txt_formate/Temporal_Anomaly_Annotation.txt",
         unit_duration: int = 2,
         overlap_ratio: float = 0.5,
         strict_normal_sampling: bool = True,
         max_files_per_class: Optional[int] = None,
+        fps: float=30.0,
         verbose: bool = True,
         seed: int = 42,
     ):
         self.feature_dir = feature_dir
-        self.annotation_dir = annotation_dir
+        self.annotation_path = annotation_path
         self.unit_duration = unit_duration
         self.overlap_ratio = overlap_ratio
         self.strict_normal_sampling = strict_normal_sampling
         self.max_files_per_class = max_files_per_class
         self.verbose = verbose
         self.seed = seed
+        self.annotation_path = annotation_path
+        self.fps = float(fps)
+    
 
         if not 0.0 <= overlap_ratio < 1.0:
             raise ValueError(f"overlap_ratio must be in [0.0, 1.0), got {overlap_ratio}")
@@ -532,7 +537,8 @@ class ETRIFeatureDataset(Dataset):
         self.annotations: Dict[str, List[Tuple[float, float]]] = {}
         self.samples: List[Dict] = []
 
-        self._load_annotations()
+        # self._load_annotations()
+        self._load_annotation_txt()
         self._build_samples()
 
         if self.verbose:
@@ -565,6 +571,78 @@ class ETRIFeatureDataset(Dataset):
 
         if self.verbose:
             print(f"Loaded annotations for {len(self.annotations)} files")
+
+    def _load_annotation_txt(self):
+        """
+        TXT line example:
+        Abuse028_x264.mp4 Abuse 165 240 -1 -1
+
+        columns:
+        0 file_name
+        1 class_name (unused for labeling, but can be stored)
+        2 start_frame_1
+        3 end_frame_1
+        4 start_frame_2 (or -1)
+        5 end_frame_2 (or -1)
+        """
+        self.annotations = {}  # file_stem -> list[(start_sec, end_sec)]
+        self.video_class = {}  # optional: file_stem -> class string
+
+        with open(self.annotation_path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                parts = line.split()
+                if len(parts) < 4:
+                    if self.verbose:
+                        print(f"[WARN] line {line_no}: too few columns -> {line}")
+                    continue
+
+                file_name = parts[0].strip()
+                cls = parts[1].strip() if len(parts) >= 2 else "unknown"
+
+                # Parse frames (robust)
+                def _to_int(x, default=-1):
+                    try:
+                        return int(x)
+                    except:
+                        return default
+
+                s1 = _to_int(parts[2])
+                e1 = _to_int(parts[3])
+                s2 = _to_int(parts[4]) if len(parts) >= 6 else -1
+                e2 = _to_int(parts[5]) if len(parts) >= 6 else -1
+
+                file_stem = os.path.splitext(os.path.basename(file_name))[0]
+                self.video_class[file_stem] = cls
+
+                events = []
+                if s1 >= 0 and e1 >= 0 and e1 >= s1:
+                    events.append((s1, e1))
+                if s2 >= 0 and e2 >= 0 and e2 >= s2:
+                    events.append((s2, e2))
+
+                if not events:
+                    # no valid events -> you may want to treat as normal video,
+                    # but in your design, normal videos usually live in Normal/ folder.
+                    continue
+
+                # Convert to seconds (end inclusive -> +1 frame)
+                sec_events = []
+                for sf, ef in events:
+                    start_sec = sf / self.fps
+                    end_sec = (ef + 1) / self.fps
+                    if end_sec > start_sec:
+                        sec_events.append((start_sec, end_sec))
+
+                if sec_events:
+                    self.annotations[file_stem] = sec_events
+
+        if self.verbose:
+            print(f"Loaded TXT annotations for {len(self.annotations)} files")
+
 
     def _build_samples(self):
         """Scan npy files and create sliding window samples."""
@@ -631,9 +709,11 @@ class ETRIFeatureDataset(Dataset):
 
         # Get feature duration from npy shape without loading full array
         feat = np.load(npy_path, mmap_mode='r')
-        total_seconds = feat.shape[0]
+        # total_seconds = feat.shape[0]
+        T = feat.shape[0]  # <= "seconds"가 아니라 "rows"
 
-        if total_seconds < self.unit_duration:
+
+        if T < self.unit_duration:
             return
 
         # If no events and not normal class, skip (missing annotation)
@@ -648,34 +728,55 @@ class ETRIFeatureDataset(Dataset):
             earliest_event_start = float('inf')  # No events for normal class
 
         # Sliding window over seconds
-        stride = max(1, int(self.unit_duration * (1.0 - self.overlap_ratio)))
-        num_windows = max(0, (total_seconds - self.unit_duration) // stride + 1)
+        stride = max(1, int(self.unit_duration * (1.0 - self.overlap_ratio)))  # row stride
+        num_windows = max(0, (T - self.unit_duration) // stride + 1)    
 
         for i in range(num_windows):
-            start_sec = i * stride
-            end_sec = start_sec + self.unit_duration
+            start_idx = i * stride
+            end_idx = start_idx + self.unit_duration  # slice rows
 
             # Label: 1 if window overlaps any event, 0 otherwise
             label = 0
             if not is_normal_class:
                 for event_start, event_end in events:
-                    if start_sec < event_end and end_sec > event_start:
+                    if start_idx < event_end and end_idx > event_start:
+                        label = 1
+                        break
+            
+        def row_to_time_interval(r: int) -> tuple[float, float]:
+            # row 정의[r-1, r+1)(0-index)에 맞춰 r<=1 예외 처리
+            start = 0.0 if r <= 1 else float(r - 1)
+            end = start + 2.0
+            return start, end
+
+        for i in range(num_windows):
+            start_idx = i * stride
+            end_idx = start_idx + self.unit_duration
+
+            seg_start_time = row_to_time_interval(start_idx)[0]
+            seg_end_time = row_to_time_interval(end_idx - 1)[1]
+
+            label = 0
+            if not is_normal_class:
+                for event_start, event_end in events:   # seconds
+                    if seg_start_time < event_end and seg_end_time > event_start:
                         label = 1
                         break
 
-            # Strict normal sampling: discard post-event normal windows in anomalous videos
             if (self.strict_normal_sampling
                     and not is_normal_class
                     and label == 0
-                    and end_sec > earliest_event_start):
+                    and seg_end_time > earliest_event_start):
                 self._discarded_post_event += 1
                 continue
 
             self.samples.append({
                 'npy_path': npy_path,
-                'start_sec': start_sec,
-                'end_sec': end_sec,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
                 'label': label,
+                'seg_start_time': seg_start_time, # 디버깅 편의
+                'seg_end_time': seg_end_time,     
             })
 
     def _print_statistics(self):
@@ -689,7 +790,7 @@ class ETRIFeatureDataset(Dataset):
         abnormal = total - normal
 
         print(f"\n{'='*50}")
-        print(f"ETRI Feature Dataset")
+        print(f"NPY Feature Dataset (Pre-extracted video features)")
         print(f"{'='*50}")
         print(f"Total samples: {total}")
         print(f"  Normal:   {normal} ({100*normal/total:.1f}%)")
@@ -713,7 +814,8 @@ class ETRIFeatureDataset(Dataset):
         """
         sample = self.samples[idx]
         feat = np.load(sample['npy_path'], mmap_mode='r')
-        window = feat[sample['start_sec']:sample['end_sec']]  # (unit_duration, D)
+        # window = feat[sample['start_sec']:sample['end_sec']]  # (unit_duration, D)
+        window = feat[sample['start_idx']:sample['end_idx']]
         feature_tensor = torch.from_numpy(np.array(window)).float()
         return feature_tensor, sample['label']
 

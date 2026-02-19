@@ -1,0 +1,7 @@
+*.png
+__pycache__
+*.sh
+logs*
+*.pth
+*.pt
+runs/*
