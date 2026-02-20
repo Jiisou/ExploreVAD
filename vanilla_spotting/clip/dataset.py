@@ -537,58 +537,80 @@ class NPYFeatureDataset(Dataset):
         self.annotations: Dict[str, List[Tuple[float, float]]] = {}
         self.samples: List[Dict] = []
 
-        # self._load_annotations()
-        self._load_annotation_txt()
+        self._load_annotations() # 입력 경로 형태에 따라 자동 파싱
+        # self._load_annotation_txt()
         self._build_samples()
 
         if self.verbose:
             self._print_statistics()
 
     def _load_annotations(self):
-        """Load annotations from all CSV files in annotation_dir."""
-        for csv_file in sorted(os.listdir(self.annotation_dir)):
-            if not csv_file.endswith('.csv'):
-                continue
-            csv_path = os.path.join(self.annotation_dir, csv_file)
-            try:
-                df = pd.read_csv(csv_path, on_bad_lines='skip')
-            except Exception as e:
-                if self.verbose:
-                    print(f"Warning: Could not read {csv_path}: {e}")
-                continue
-
-            for _, row in df.iterrows():
-                file_name = str(row['file_name']).strip()
-                # Remove video extension if present (.mp4, .avi, etc.) for matching with npy stems
-                file_stem = os.path.splitext(file_name)[0]
-                start_time = time_to_seconds(row.get('start_time', 0))
-                end_time = time_to_seconds(row.get('end_time', 0))
-
-                if end_time > start_time:
-                    if file_stem not in self.annotations:
-                        self.annotations[file_stem] = []
-                    self.annotations[file_stem].append((start_time, end_time))
-
-        if self.verbose:
-            print(f"Loaded annotations for {len(self.annotations)} files")
-
-    def _load_annotation_txt(self):
         """
-        TXT line example:
+        Load annotations from either:
+        - a directory (train/ val/ test/ annotation folders)
+        - a single .txt file (UCF Crime temporal annotation format)
+        - a single .csv file (old per-class timestamp csv)
+        """
+        p = self.annotation_path
+
+        if os.path.isdir(p):
+            # Directory mode: parse all supported annotation files inside
+            txt_files = sorted([
+                os.path.join(p, fn) for fn in os.listdir(p)
+                if fn.lower().endswith(".txt")
+            ])
+            csv_files = sorted([
+                os.path.join(p, fn) for fn in os.listdir(p)
+                if fn.lower().endswith(".csv")
+            ])
+
+            if self.verbose:
+                print(f"[Annotations] dir={p} | txt={len(txt_files)} csv={len(csv_files)}")
+
+            # Prefer txt if present (UCF Crime official format), but also allow csv
+            for txt_path in txt_files:
+                self._load_annotation_txt_file(txt_path)
+
+            for csv_path in csv_files:
+                self._load_annotation_csv_file(csv_path)
+
+            # if self.verbose:
+            #     print(f"[Annotations] loaded files: {len(self.annotations)} videos")
+            return
+
+        # Single file mode
+        ext = os.path.splitext(p)[1].lower()
+        if ext == ".txt":
+            self._load_annotation_txt_file(p)
+        elif ext == ".csv":
+            self._load_annotation_csv_file(p)
+        else:
+            raise ValueError(f"Unsupported annotation_path: {p} (expected dir, .txt, or .csv)")
+
+    def _load_annotation_txt_file(self, txt_path: str):
+        """
+        Load UCF-Crime temporal annotation txt file.
+
+        Line example:
         Abuse028_x264.mp4 Abuse 165 240 -1 -1
 
         columns:
         0 file_name
-        1 class_name (unused for labeling, but can be stored)
+        1 class_name
         2 start_frame_1
         3 end_frame_1
         4 start_frame_2 (or -1)
         5 end_frame_2 (or -1)
         """
-        self.annotations = {}  # file_stem -> list[(start_sec, end_sec)]
-        self.video_class = {}  # optional: file_stem -> class string
+        if not hasattr(self, "video_class"):
+            self.video_class = {}
 
-        with open(self.annotation_path, "r", encoding="utf-8") as f:
+        # keep existing content if multiple files
+        # (do NOT reset self.annotations here)
+        if self.annotations is None:
+            self.annotations = {}
+
+        with open(txt_path, "r", encoding="utf-8") as f:
             for line_no, line in enumerate(f, 1):
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -597,13 +619,12 @@ class NPYFeatureDataset(Dataset):
                 parts = line.split()
                 if len(parts) < 4:
                     if self.verbose:
-                        print(f"[WARN] line {line_no}: too few columns -> {line}")
+                        print(f"[WARN] {txt_path}:{line_no} too few columns -> {line}")
                     continue
 
                 file_name = parts[0].strip()
                 cls = parts[1].strip() if len(parts) >= 2 else "unknown"
 
-                # Parse frames (robust)
                 def _to_int(x, default=-1):
                     try:
                         return int(x)
@@ -618,30 +639,89 @@ class NPYFeatureDataset(Dataset):
                 file_stem = os.path.splitext(os.path.basename(file_name))[0]
                 self.video_class[file_stem] = cls
 
-                events = []
+                events_frames = []
                 if s1 >= 0 and e1 >= 0 and e1 >= s1:
-                    events.append((s1, e1))
+                    events_frames.append((s1, e1))
                 if s2 >= 0 and e2 >= 0 and e2 >= s2:
-                    events.append((s2, e2))
+                    events_frames.append((s2, e2))
 
-                if not events:
-                    # no valid events -> you may want to treat as normal video,
-                    # but in your design, normal videos usually live in Normal/ folder.
+                if not events_frames:
                     continue
 
-                # Convert to seconds (end inclusive -> +1 frame)
+                # Convert frames -> seconds (end inclusive -> +1 frame)
                 sec_events = []
-                for sf, ef in events:
+                for sf, ef in events_frames:
                     start_sec = sf / self.fps
                     end_sec = (ef + 1) / self.fps
                     if end_sec > start_sec:
                         sec_events.append((start_sec, end_sec))
 
                 if sec_events:
-                    self.annotations[file_stem] = sec_events
+                    # append (not overwrite) if already exists
+                    if file_stem not in self.annotations:
+                        self.annotations[file_stem] = []
+                    self.annotations[file_stem].extend(sec_events)
 
-        if self.verbose:
-            print(f"Loaded TXT annotations for {len(self.annotations)} files")
+        # if self.verbose:
+        #     print(f"[Annotations] loaded txt: {txt_path}")
+
+    def _load_annotation_csv_file(self, csv_path: str):
+        """Load legacy per-class timestamp csv file."""
+        try:
+            df = pd.read_csv(csv_path, on_bad_lines="skip")
+        except Exception as e:
+            if self.verbose:
+                print(f"[WARN] Could not read {csv_path}: {e}")
+            return
+
+        # helper: robust time parsing (fallback)
+        def _time_to_sec(x):
+            if pd.isna(x):
+                return None
+            s = str(x).strip()
+            if not s:
+                return None
+            # support: ss, mm:ss, hh:mm:ss
+            parts = s.split(":")
+            try:
+                parts = [float(p) for p in parts]
+            except:
+                return None
+            if len(parts) == 1:
+                return parts[0]
+            if len(parts) == 2:
+                m, sec = parts
+                return m * 60 + sec
+            if len(parts) == 3:
+                h, m, sec = parts
+                return h * 3600 + m * 60 + sec
+            return None
+
+        n_added = 0
+
+        for _, row in df.iterrows():
+            file_name = str(row.get("file_name", "")).strip().split()[0]
+            if not file_name:
+                continue
+
+            file_stem = os.path.splitext(os.path.basename(file_name))[0]
+            start_sec = end_sec = None
+        
+            if start_sec is None or end_sec is None:
+                start_sec = _time_to_sec(row.get("start_time", None))
+                end_sec = _time_to_sec(row.get("end_time", None))
+
+            if start_sec is None or end_sec is None:
+                continue
+
+            if end_sec > start_sec:
+                if file_stem not in self.annotations:
+                    self.annotations[file_stem] = []
+                self.annotations[file_stem].append((start_sec, end_sec))
+                n_added += 1
+
+        # if self.verbose:
+        #     print(f"[Annotations] loaded csv: {csv_path}")
 
 
     def _build_samples(self):
@@ -712,7 +792,8 @@ class NPYFeatureDataset(Dataset):
         # total_seconds = feat.shape[0]
         T = feat.shape[0]  # <= "seconds"가 아니라 "rows"
 
-
+        if is_normal_class:
+            T = min(T, 40)
         if T < self.unit_duration:
             return
 
@@ -729,20 +810,8 @@ class NPYFeatureDataset(Dataset):
 
         # Sliding window over seconds
         stride = max(1, int(self.unit_duration * (1.0 - self.overlap_ratio)))  # row stride
-        num_windows = max(0, (T - self.unit_duration) // stride + 1)    
+        num_windows = max(0, (T - self.unit_duration) // stride + 1)
 
-        for i in range(num_windows):
-            start_idx = i * stride
-            end_idx = start_idx + self.unit_duration  # slice rows
-
-            # Label: 1 if window overlaps any event, 0 otherwise
-            label = 0
-            if not is_normal_class:
-                for event_start, event_end in events:
-                    if start_idx < event_end and end_idx > event_start:
-                        label = 1
-                        break
-            
         def row_to_time_interval(r: int) -> tuple[float, float]:
             # row 정의[r-1, r+1)(0-index)에 맞춰 r<=1 예외 처리
             start = 0.0 if r <= 1 else float(r - 1)
@@ -763,10 +832,11 @@ class NPYFeatureDataset(Dataset):
                         label = 1
                         break
 
-            if (self.strict_normal_sampling
-                    and not is_normal_class
+            # strict_normal_sampling=True : abnormal 폴더의 label=0 윈도우 전부 제외
+            # strict_normal_sampling=False: post-event 노이즈만 제외, pre-event normal은 허용
+            if (not is_normal_class
                     and label == 0
-                    and seg_end_time > earliest_event_start):
+                    and (self.strict_normal_sampling or seg_end_time > earliest_event_start)):
                 self._discarded_post_event += 1
                 continue
 
@@ -776,7 +846,7 @@ class NPYFeatureDataset(Dataset):
                 'end_idx': end_idx,
                 'label': label,
                 'seg_start_time': seg_start_time, # 디버깅 편의
-                'seg_end_time': seg_end_time,     
+                'seg_end_time': seg_end_time,
             })
 
     def _print_statistics(self):

@@ -168,15 +168,15 @@ def train(
     dropout_rate: float = 0.5,
     batch_size: int = 64,
     num_workers: int = 4,
-    epochs: int = 30,
+    epochs: int = 40,
     lr: float = 1e-4,
     weight_decay: float = 1e-4,
     warmup_epochs: int = 2,
     patience: int = 5,
-    checkpoint_dir: str = "./vanilla_spotting/clip/npy_training/checkpoints",
+    checkpoint_dir: str = "./vanilla_spotting/clip/npy_resmlp_training/checkpoints",
     save_name: str = "resmlp_spotting",
     save_interval: int = 5,
-    log_dir: str = "./vanilla_spotting/clip/npy_training/runs",
+    log_dir: str = "./vanilla_spotting/clip/npy_resmlp_training/runs",
     val_split: float = 0.1,
     seed: int = 42,
     resume_ckpt: str = None,
@@ -196,10 +196,10 @@ def train(
     print("\nLoading dataset...")
     full_dataset = NPYFeatureDataset(
         feature_dir=feature_dir,
-        annotation_dir=annotation_dir,
+        annotation_path=annotation_dir,
         unit_duration=unit_duration,
         overlap_ratio=overlap_ratio,
-        strict_normal_sampling=True,
+        strict_normal_sampling=True, # False는 pre-event normal=0 은 허용 (post-event normal은 제외, 노이즈)
         verbose=True,
         seed=seed,
     )
@@ -384,7 +384,7 @@ def parse_args():
                         help="Batch size")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="Number of data loading workers")
-    parser.add_argument("--epochs", type=int, default=30,
+    parser.add_argument("--epochs", type=int, default=40,
                         help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=1e-4,
                         help="Learning rate")

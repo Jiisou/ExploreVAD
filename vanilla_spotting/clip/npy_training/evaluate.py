@@ -129,20 +129,20 @@ def compute_metrics(
 
     total_support = len(labels)
 
-    # Optimal threshold via Youden's J statistic
-    if len(np.unique(labels)) > 1:
-        fpr, tpr, thresholds = roc_curve(labels, probs)
-        j_scores = tpr - fpr
-        optimal_idx = np.argmax(j_scores)
-        optimal_threshold = thresholds[optimal_idx]
+    # # Optimal threshold via Youden's J statistic
+    # if len(np.unique(labels)) > 1:
+    #     fpr, tpr, thresholds = roc_curve(labels, probs)
+    #     j_scores = tpr - fpr
+    #     optimal_idx = np.argmax(j_scores)
+    #     optimal_threshold = thresholds[optimal_idx]
 
-        optimal_preds = (probs >= optimal_threshold).astype(int)
-        opt_precision, opt_recall, opt_f1, _ = precision_recall_fscore_support(
-            labels, optimal_preds, average='binary', zero_division=0
-        )
-    else:
-        optimal_threshold = threshold
-        opt_precision = opt_recall = opt_f1 = float('nan')
+    #     optimal_preds = (probs >= optimal_threshold).astype(int)
+    #     opt_precision, opt_recall, opt_f1, _ = precision_recall_fscore_support(
+    #         labels, optimal_preds, average='binary', zero_division=0
+    #     )
+    # else:
+    #     optimal_threshold = threshold
+    #     opt_precision = opt_recall = opt_f1 = float('nan')
 
     return {
         'accuracy': accuracy,
@@ -159,10 +159,10 @@ def compute_metrics(
         'recall_weighted': recall_weighted,
         'f1_weighted': f1_weighted,
         'total_support': total_support,
-        'optimal_threshold': optimal_threshold,
-        'opt_precision': opt_precision,
-        'opt_recall': opt_recall,
-        'opt_f1': opt_f1,
+        # 'optimal_threshold': optimal_threshold,
+        # 'opt_precision': opt_precision,
+        # 'opt_recall': opt_recall,
+        # 'opt_f1': opt_f1,
     }
 
 
@@ -513,10 +513,10 @@ def print_metrics_report(metrics: Dict):
             print(f"    F1:        {metrics['f1_per_class'][i]:.4f}")
             print(f"    Support:   {metrics['support_per_class'][i]}")
 
-    print(f"\n[Optimal Threshold: {metrics['optimal_threshold']:.4f}]")
-    print(f"  Precision:   {metrics['opt_precision']:.4f}")
-    print(f"  Recall:      {metrics['opt_recall']:.4f}")
-    print(f"  F1 Score:    {metrics['opt_f1']:.4f}")
+    # print(f"\n[Optimal Threshold: {metrics['optimal_threshold']:.4f}]")
+    # print(f"  Precision:   {metrics['opt_precision']:.4f}")
+    # print(f"  Recall:      {metrics['opt_recall']:.4f}")
+    # print(f"  F1 Score:    {metrics['opt_f1']:.4f}")
 
     print(f"\n[Confusion Matrix]")
     cm = metrics['confusion_matrix']
@@ -1179,20 +1179,20 @@ def evaluate(
             )
 
     # Save results
-    np.savez(
-        os.path.join(output_dir, "results.npz"),
-        # Segment-level
-        labels=results['labels'],
-        probs=results['probs'],
-        logits_normal=results['logits_normal'],
-        logits_anomaly=results['logits_anomaly'],
-        preds=results['preds'],
-        # Video-level
-        video_labels=video_metrics['video_labels'],
-        video_probs=video_metrics['video_probs'],
-        video_preds=video_metrics['video_preds'],
-    )
-    print(f"\nResults saved to {output_dir}")
+    # np.savez(
+    #     os.path.join(output_dir, "results.npz"),
+    #     # Segment-level
+    #     labels=results['labels'],
+    #     probs=results['probs'],
+    #     logits_normal=results['logits_normal'],
+    #     logits_anomaly=results['logits_anomaly'],
+    #     preds=results['preds'],
+    #     # Video-level
+    #     video_labels=video_metrics['video_labels'],
+    #     video_probs=video_metrics['video_probs'],
+    #     video_preds=video_metrics['video_preds'],
+    # )
+    # print(f"\nResults saved to {output_dir}")
 
     return metrics, file_scores, video_metrics
 
