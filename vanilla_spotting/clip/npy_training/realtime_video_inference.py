@@ -93,7 +93,7 @@ class MobileCLIPExtractor:
             print(f"Loading MobileCLIP2 model: {model_name}")
             model_kwargs = {}
             if not (model_name.endswith("S3") or model_name.endswith("S4") or model_name.endswith("L-14")):
-                model_kwargs = {"image_mean": (0, 0, 0), "image_std": (1, 1, 1)}
+                model_kwargs = {"image_mean": (0, 0, 0), "image_std": (1, 1, 1)} # s0, s1, s2
 
             self.model, _, self.preprocess = open_clip.create_model_and_transforms(
                 model_name,
@@ -195,6 +195,7 @@ class RealtimeVideoInference:
         stride_time: float = 1.0,
         threshold: float = 0.5,
         gt_annotation: Optional[Dict[int, int]] = None,
+        early_inference: bool = True,
     ):
         self.extractor = feature_extractor
         self.classifier = classifier
@@ -223,6 +224,9 @@ class RealtimeVideoInference:
         self.latency_e2e = 0.0
         self.latency_gpu = 0.0 # GPU 피처 추출 연산 시간
 
+        # For early inference at video start
+        self.early_inference_done = False  # Flag to ensure early inference happens once
+
     def reset(self):
         """Reset state for new video."""
         self.latest_label = "SCANNING"
@@ -233,6 +237,7 @@ class RealtimeVideoInference:
         self.timeline_data = []
         self.inference_triggers = []
         self.frame_buffer.clear()
+        self.early_inference_done = False
 
     def update_buffer(self, frame: np.ndarray):
         """Store raw numpy frame. Very fast."""
@@ -700,14 +705,37 @@ def process_video_realtime(
         current_time = frame_idx / fps
         frame_idx += 1
 
-        # Trigger inference at stride intervals
-        if current_time - last_inference_time >= inference_engine.stride_time:
+        # Early inference at video start (0-1 sec, using num_frames/2)
+        if current_time <= 1.0 and not inference_engine.early_inference_done:
+            if not inference_engine.is_processing and len(inference_engine.frame_buffer) >= inference_engine.num_frames // 2:
+                inference_engine.is_processing = True
+                inference_engine.early_inference_done = True
+                last_inference_time = current_time
+
+                # Sample only half frames from 0-1 second window for early prediction
+                buffer_frames = list(inference_engine.frame_buffer)
+                num_early_frames = inference_engine.num_frames // 2
+
+                # Linear sampling with replication if needed
+                indices = np.linspace(0, len(buffer_frames) - 1, num_early_frames, dtype=int)
+                sampled_raw_frames = [buffer_frames[i] for i in indices]
+
+                # Start inference thread
+                thread = threading.Thread(
+                    target=inference_engine.run_inference,
+                    args=(sampled_raw_frames, current_time),
+                    daemon=True
+                )
+                thread.start()
+
+        # Regular inference at stride intervals (after early inference)
+        elif current_time - last_inference_time >= inference_engine.stride_time:
             if not inference_engine.is_processing:
                 # 버퍼에 데이터가 있는지 확인
                 if len(inference_engine.frame_buffer) > 0:
                     inference_engine.is_processing = True
                     last_inference_time = current_time
-                    
+
                     # 샘플링 (여기서는 Numpy Array 리스트가 반환됨)
                     sampled_raw_frames = inference_engine._get_sampled_frames()
 
