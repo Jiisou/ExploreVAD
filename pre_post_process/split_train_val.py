@@ -44,7 +44,7 @@ def split_train_val(root_dir: str, output_dir: str, extension: str, seed: int = 
             target_path.mkdir(parents=True, exist_ok=True)
 
             for f in split_files:
-                shutil.copy2(f, target_path / f.name)
+                shutil.copy(f, target_path / f.name)
 
         # 결과 출력
         print(f"Completed: {event_name:<15} | Total: {n_total:>4} | Tr: {len(file_mapping['train']):>4} | Val: {len(file_mapping['valid']):>4}")

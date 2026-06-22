@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 Realtime Video Inference Visualizer for Anomaly Action Spotting.
 
 Uses MobileCLIP for feature extraction and ResidualMLPSpottingModel for classification.
@@ -8,16 +8,14 @@ Displays video playback with timeline visualization showing prediction results.
 Reference style: qwen3-vl-2b-int4-video_binary_timeline.py
 
 Usage:
-    python realtime_video_inference.py \
-        --checkpoint model.pth \
-        --video video.mp4 \
-        --model-name mobileclip_s0
+    python realtime_video_inference.py 
+        --checkpoint "C:\Users\USER\Desktop\ucf_vad\ckpts\resmlp_spotting_aucbest_18.pth" 
+        --video "C:\Users\USER\Desktop\ucf_vad\Abuse\Abuse001_x264.mp4"
 
     # With directory of videos:
-    python realtime_video_inference.py \
-        --checkpoint model.pth \
-        --video-dir /path/to/videos \
-        --model-name mobileclip_s0
+    python realtime_video_inference.py 
+        --checkpoint model.pth 
+        --video-dir /path/to/videos 
 """
 
 import argparse
@@ -861,11 +859,11 @@ def parse_args():
     )
 
     # Required
-    parser.add_argument("--checkpoint", type=str, required=True,
+    parser.add_argument("--checkpoint", type=str, default=r"C:\Users\USER\Desktop\ucf_vad\ckpts\resmlp_spotting_aucbest_18.pth", #required=True,
                         help="Path to ResidualMLPSpottingModel checkpoint")
 
     # Input
-    parser.add_argument("--video", type=str, default=None,
+    parser.add_argument("--video", type=str, default=r"C:\Users\USER\Desktop\ucf_vad\Abuse\Abuse001_x264.mp4",
                         help="Path to a single video file")
     parser.add_argument("--video-dir", type=str, default=None,
                         help="Directory containing videos (recursive)")
